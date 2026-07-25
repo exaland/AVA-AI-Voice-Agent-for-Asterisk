@@ -95,6 +95,10 @@ class LocalProviderConfig(BaseModel):
     auth_token: Optional[str] = None
     connect_timeout_sec: float = Field(default=5.0)
     response_timeout_sec: float = Field(default=5.0)
+    # Per-call TTS egress target. Audio profiles override these on call-owned
+    # provider instances; defaults preserve the historical Local AI contract.
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
     # MED-R3: max total wall-time the mid-call background reconnect will keep
     # retrying after the Local AI Server WebSocket drops mid-call. While retrying,
     # inbound caller audio is dropped (the caller hears silence), so this bounds
@@ -1222,6 +1226,14 @@ class AppConfig(BaseModel):
         for profile_name, raw_profile in self.profiles.items():
             if profile_name == "default" or not isinstance(raw_profile, dict):
                 continue
+            if "talk_detect_talking_threshold" in raw_profile:
+                threshold = raw_profile.get("talk_detect_talking_threshold")
+                if type(threshold) is not int or not 1 <= threshold <= 32768:
+                    raise ValueError(
+                        f"profiles.{profile_name}.talk_detect_talking_threshold "
+                        "must be an integer from 1 to 32768; "
+                        f"got {threshold!r}"
+                    )
             if "output_resampler" in raw_profile:
                 validate_resampler(
                     f"profiles.{profile_name}.output_resampler",

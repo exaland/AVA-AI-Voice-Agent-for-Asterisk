@@ -22,6 +22,7 @@ from typing import Dict, Any, Optional, List, Union
 from structlog import get_logger
 
 from ..providers.base import ProviderCapabilities
+from ..audio.audiosocket_protocol import normalize_slin_format
 
 logger = get_logger(__name__)
 
@@ -64,6 +65,7 @@ class AudioProfile:
     output_resampler: str = "linear"
     chunk_ms: str | int = "auto"
     idle_cutoff_ms: int = 1200
+    talk_detect_talking_threshold: Optional[int] = None
 
 
 @dataclass
@@ -194,6 +196,7 @@ class TransportProfile:
     output_resampler_source: str = "profile"
     context: Optional[str] = None
     remediation: Optional[str] = None
+    talk_detect_talking_threshold: Optional[int] = None
 
 
 class TransportOrchestrator:
@@ -250,6 +253,9 @@ class TransportOrchestrator:
                     output_resampler=profile_dict.get('output_resampler', 'linear'),
                     chunk_ms=profile_dict.get('chunk_ms', 'auto'),
                     idle_cutoff_ms=profile_dict.get('idle_cutoff_ms', 1200),
+                    talk_detect_talking_threshold=profile_dict.get(
+                        'talk_detect_talking_threshold'
+                    ),
                 )
                 logger.debug("Loaded audio profile", name=name, profile=profiles[name])
             except Exception as exc:
@@ -485,15 +491,34 @@ class TransportOrchestrator:
         """
         Negotiate formats between profile preferences and provider capabilities.
         
-        Wire format: For AudioSocket, use audiosocket.format (authoritative).
-                     For RTP, use profile.transport_out (negotiated codec).
+        Wire format: AudioSocket signed-linear profiles may opt into their
+                     rate-specific wire format. Companded profiles retain the
+                     global AudioSocket fallback for backward compatibility.
+                     RTP always uses profile.transport_out.
         Provider format: try profile preference, fallback to provider's supported formats.
         """
         # CRITICAL: Wire format depends on transport type
         if self.audio_transport == "audiosocket":
-            # AudioSocket: use actual format from audiosocket.format config
+            # AudioSocket message types represent signed-linear sample rates.
+            # A signed-linear profile selects its matching wire type. Companded
+            # profiles use the 8 kHz signed-linear compatibility carrier; they
+            # must never inherit a process-wide slin16 setting from another call.
             wire_enc = self.audiosocket_format
             wire_rate = self.audiosocket_sample_rate
+            profile_wire_enc = profile.transport_out.get('encoding', '')
+            profile_wire_rate = profile.transport_out.get('sample_rate_hz')
+            try:
+                wire_enc, wire_rate = normalize_slin_format(
+                    profile_wire_enc,
+                    int(profile_wire_rate) if profile_wire_rate is not None else None,
+                )
+            except (TypeError, ValueError):
+                profile_encoding = str(profile_wire_enc or "").strip().lower()
+                if profile_encoding in {
+                    "ulaw", "mulaw", "mu-law", "g711_ulaw",
+                    "alaw", "a-law", "g711_alaw",
+                }:
+                    wire_enc, wire_rate = "slin", 8000
             if not wire_rate:
                 # Infer rate from format: slin=8kHz, slin16=16kHz
                 wire_enc_lower = wire_enc.lower().strip()
@@ -510,7 +535,10 @@ class TransportOrchestrator:
             wire_enc = profile.transport_out.get('encoding', 'slin')
             wire_rate = profile.transport_out.get('sample_rate_hz', 8000)
         
-        # CRITICAL: Read provider's actual requirements from provider config
+        # Read the provider's configured requirements. Compatibility profiles
+        # retain these values exactly. An explicitly selected wideband linear
+        # profile may replace them below with the provider's declared native
+        # wideband boundary, keeping the choice call-scoped.
         # Modern providers (Google Live, OpenAI) have provider_input_* fields
         # Legacy providers (Deepgram Voice Agent) use input_* fields
         # Fall back to profile preferences if provider config unavailable
@@ -548,6 +576,29 @@ class TransportOrchestrator:
             pref_out_enc = profile.provider_pref.get('output_encoding', 'linear16')
             pref_in_rate = profile.provider_pref.get('input_sample_rate_hz', 16000)
             pref_out_rate = profile.provider_pref.get('output_sample_rate_hz', 16000)
+
+        normalized_wire = self._normalize_encoding(str(wire_enc or ""))
+        wideband_selected = bool(
+            self.audio_transport == "audiosocket"
+            and normalized_wire == "linear16"
+            and int(wire_rate or 0) >= 16000
+        )
+        provider_format_source = "provider-config"
+        if wideband_selected and provider_caps:
+            wideband_values = (
+                provider_caps.wideband_input_encoding,
+                provider_caps.wideband_input_sample_rate_hz,
+                provider_caps.wideband_output_encoding,
+                provider_caps.wideband_output_sample_rate_hz,
+            )
+            if all(value is not None for value in wideband_values):
+                pref_in_enc = str(provider_caps.wideband_input_encoding)
+                pref_in_rate = int(provider_caps.wideband_input_sample_rate_hz)
+                pref_out_enc = str(provider_caps.wideband_output_encoding)
+                pref_out_rate = int(provider_caps.wideband_output_sample_rate_hz)
+                provider_format_source = "provider-wideband-capability"
+            else:
+                provider_format_source = "provider-config-no-wideband-route"
         
         # Negotiate with provider if capabilities available
         if provider_caps:
@@ -602,12 +653,15 @@ class TransportOrchestrator:
             output_resampler=profile.output_resampler,
             output_resampler_source=f"profile:{profile.name}",
             context=context_name,  # Propagate context for greeting/prompt injection
+            talk_detect_talking_threshold=profile.talk_detect_talking_threshold,
         )
         
         logger.debug(
             "Negotiated transport profile",
             profile=profile.name,
             transport=transport,
+            provider_format_source=provider_format_source,
+            wideband_selected=wideband_selected,
         )
         
         return transport
@@ -722,6 +776,12 @@ class TransportOrchestrator:
             issues.append(
                 f"Provider may not support input rate {transport.provider_input_sample_rate} Hz "
                 f"(supported: {provider_caps.input_sample_rates_hz})"
+            )
+
+        if transport.provider_output_sample_rate not in provider_caps.output_sample_rates_hz:
+            issues.append(
+                f"Provider may not support output rate {transport.provider_output_sample_rate} Hz "
+                f"(supported: {provider_caps.output_sample_rates_hz})"
             )
         
         # Add remediation if issues found

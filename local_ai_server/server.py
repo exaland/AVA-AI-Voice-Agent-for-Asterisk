@@ -749,7 +749,7 @@ class _LegacyAudioProcessor:
 # Backends and audio processor are maintained in separate modules for easier development.
 from stt_backends import KrokoSTTBackend, SherpaONNXSTTBackend, ToneSTTBackend
 from tts_backends import KokoroTTSBackend
-from audio_processor import AudioProcessor
+from audio_processor import AudioProcessor, SynthesizedAudio
 
 
 class LocalAIServer:
@@ -805,7 +805,7 @@ class LocalAIServer:
         self._filler_cache: dict[str, bytes] = {}
 
         # TTS phrase cache (keyed by backend:model:text)
-        self._tts_cache: dict[str, bytes] = {}
+        self._tts_cache: dict[str, SynthesizedAudio] = {}
 
         # Audio buffering for STT (20ms chunks need to be buffered for effective STT)
         self.audio_buffer = b""
@@ -3068,42 +3068,171 @@ class LocalAIServer:
         session.llm_user_turns = [m.get("content", "") for m in trimmed_messages if (m.get("role") or "").lower() == "user"]
         return prompt_text, prompt_tokens, truncated, raw_tokens, chat_messages
 
-    def _tts_cache_key(self, text: str) -> str:
+    def _resolve_tts_output_contract(
+        self,
+        encoding: Optional[Any],
+        sample_rate_hz: Optional[Any],
+    ) -> Tuple[str, int]:
+        """Resolve a requested TTS format to one the active backend can emit."""
+        normalized = str(encoding or "mulaw").strip().lower().replace("-", "")
+        if normalized in {"ulaw", "mulaw", "g711ulaw", "mu_law", "μ-law"}:
+            normalized = "mulaw"
+        elif normalized in {"linear16", "pcm16", "slin16", "slin"}:
+            normalized = "linear16"
+        else:
+            normalized = "mulaw"
+
+        try:
+            rate = int(sample_rate_hz or ULAW_SAMPLE_RATE)
+        except (TypeError, ValueError):
+            rate = ULAW_SAMPLE_RATE
+
+        if (
+            normalized == "linear16"
+            and rate == PCM16_TARGET_RATE
+            and self.tts_backend in {"piper", "kokoro"}
+        ):
+            return "linear16", PCM16_TARGET_RATE
+        if normalized == "mulaw" and rate == ULAW_SAMPLE_RATE:
+            return "mulaw", ULAW_SAMPLE_RATE
+
+        logging.warning(
+            "Unsupported Local TTS output requested; using legacy μ-law/8k "
+            "backend=%s requested=%s@%s call_id=%s",
+            self.tts_backend,
+            encoding,
+            sample_rate_hz,
+            _CALL_LOG_CONTEXT.get(),
+        )
+        return "mulaw", ULAW_SAMPLE_RATE
+
+    def _apply_tts_output_preferences(
+        self,
+        session: SessionContext,
+        data: Dict[str, Any],
+        *,
+        reset_if_missing: bool = False,
+    ) -> None:
+        """Bind optional client TTS preferences to this WebSocket session."""
+        encoding = data.get("output_encoding")
+        if encoding is None and data.get("type") == "tts_request":
+            encoding = data.get("encoding")
+        sample_rate = data.get("output_sample_rate_hz")
+        if sample_rate is None and data.get("type") == "tts_request":
+            sample_rate = data.get("sample_rate_hz")
+
+        if encoding is None and sample_rate is None and not reset_if_missing:
+            return
+        resolved_encoding, resolved_rate = self._resolve_tts_output_contract(
+            encoding if encoding is not None else "mulaw",
+            sample_rate if sample_rate is not None else ULAW_SAMPLE_RATE,
+        )
+        changed = (
+            session.tts_output_encoding != resolved_encoding
+            or session.tts_output_sample_rate_hz != resolved_rate
+        )
+        session.tts_output_encoding = resolved_encoding
+        session.tts_output_sample_rate_hz = resolved_rate
+        if changed:
+            logging.info(
+                "Local TTS output contract resolved call_id=%s backend=%s encoding=%s sample_rate_hz=%s",
+                session.call_id,
+                self.tts_backend,
+                resolved_encoding,
+                resolved_rate,
+            )
+
+    def _tts_cache_key(self, text: str, encoding: str = "mulaw", sample_rate_hz: int = ULAW_SAMPLE_RATE) -> str:
         """Build a cache key from TTS backend + model path + voice params + text."""
         model_path = getattr(self, "tts_model_path", "") or ""
         # Include voice-specific params to avoid serving stale audio after config change
         speaker = getattr(self, "silero_speaker", "") or ""
         voice = getattr(self, "kokoro_voice", "") or ""
-        return f"{self.tts_backend}:{model_path}:{speaker}:{voice}:{text.strip()}"
+        return f"{self.tts_backend}:{model_path}:{speaker}:{voice}:{encoding}:{sample_rate_hz}:{text.strip()}"
 
     async def process_tts(self, text: str) -> bytes:
-        """Process TTS with 8kHz uLaw generation - routes to appropriate backend.
+        """Backward-compatible legacy TTS API returning μ-law/8 kHz bytes."""
+        return (await self.process_tts_audio(text)).data
+
+    async def process_tts_audio(
+        self,
+        text: str,
+        *,
+        output_encoding: str = "mulaw",
+        output_sample_rate_hz: int = ULAW_SAMPLE_RATE,
+    ) -> SynthesizedAudio:
+        """Synthesize TTS with truthful per-call output metadata.
 
         Optionally caches short phrases to avoid re-synthesis.
         """
+        encoding, sample_rate_hz = self._resolve_tts_output_contract(
+            output_encoding,
+            output_sample_rate_hz,
+        )
         # TTS phrase cache: return cached audio for repeated short phrases
         if self.config.tts_phrase_cache_enabled and len(text) <= self.config.tts_phrase_cache_max_text_len:
-            cache_key = self._tts_cache_key(text)
+            cache_key = self._tts_cache_key(text, encoding, sample_rate_hz)
             cached = self._tts_cache.get(cache_key)
             if cached is not None:
-                logging.debug("🔊 TTS CACHE HIT - text=%s bytes=%d", text[:40], len(cached))
+                logging.debug("🔊 TTS CACHE HIT - text=%s bytes=%d encoding=%s sample_rate_hz=%d", text[:40], len(cached.data), cached.encoding, cached.sample_rate_hz)
                 return cached
 
-        if self.tts_backend == "kokoro":
-            result = await self._process_tts_kokoro(text)
+        if encoding == "linear16" and self.tts_backend in {"piper", "kokoro"}:
+            result_bytes = b""
+            if self.tts_backend == "piper" and not getattr(self, "tts_model", None):
+                logging.error("Piper TTS model not loaded")
+            else:
+                try:
+                    if self.tts_backend == "piper":
+                        async with self._tts_lock:
+                            native_pcm = await asyncio.to_thread(
+                                self._synthesize_piper_pcm16, text
+                            )
+                        native_rate = 22050
+                    else:
+                        native_pcm, native_rate = await self._synthesize_kokoro_pcm16(text)
+                    result_bytes = await asyncio.to_thread(
+                        self.audio_processor.resample_audio,
+                        native_pcm,
+                        native_rate,
+                        sample_rate_hz,
+                    )
+                    logging.info(
+                        "🔊 TTS RESULT - %s generated linear16 audio: %s bytes native_sample_rate_hz=%s sample_rate_hz=%s call_id=%s",
+                        self.tts_backend.capitalize(),
+                        len(result_bytes),
+                        native_rate,
+                        sample_rate_hz,
+                        _CALL_LOG_CONTEXT.get(),
+                    )
+                except Exception as exc:
+                    logging.error(
+                        "Wideband TTS synthesis failed backend=%s: %s",
+                        self.tts_backend,
+                        exc,
+                        exc_info=True,
+                    )
+        elif self.tts_backend == "kokoro":
+            result_bytes = await self._process_tts_kokoro(text)
         elif self.tts_backend == "melotts":
-            result = await self._process_tts_melotts(text)
+            result_bytes = await self._process_tts_melotts(text)
         elif self.tts_backend == "silero":
-            result = await self._process_tts_silero(text)
+            result_bytes = await self._process_tts_silero(text)
         elif self.tts_backend == "matcha":
-            result = await self._process_tts_matcha(text)
+            result_bytes = await self._process_tts_matcha(text)
         else:
-            result = await self._process_tts_piper(text)
+            result_bytes = await self._process_tts_piper(text)
+
+        result = SynthesizedAudio(
+            data=result_bytes,
+            encoding=encoding,
+            sample_rate_hz=sample_rate_hz,
+        )
 
         # Cache short phrases (LRU eviction at 256 entries)
         if (
             self.config.tts_phrase_cache_enabled
-            and result
+            and result.data
             and len(text) <= self.config.tts_phrase_cache_max_text_len
         ):
             _MAX_TTS_CACHE = 256
@@ -3114,7 +3243,7 @@ class LocalAIServer:
                     del self._tts_cache[oldest_key]
                 except StopIteration:
                     pass
-            self._tts_cache[self._tts_cache_key(text)] = result
+            self._tts_cache[self._tts_cache_key(text, encoding, sample_rate_hz)] = result
 
         return result
 
@@ -3194,28 +3323,17 @@ class LocalAIServer:
             return wf.readframes(wf.getnframes())
 
     async def _process_tts_kokoro(self, text: str) -> bytes:
-        """Process TTS using Kokoro backend (24kHz output)."""
+        """Process native Kokoro local/API PCM into legacy μ-law/8 kHz."""
         try:
-            if self.kokoro_mode == "api":
-                return await self._process_tts_kokoro_api(text)
-
-            if not self.kokoro_backend:
-                logging.error("Kokoro TTS backend not initialized")
-                return b""
-
-            logging.debug("🔊 TTS INPUT - Generating 24kHz audio for: '%s'", text)
-
-            # Get PCM16 audio at 24kHz from Kokoro
-            async with self._tts_lock:
-                pcm16_data = await asyncio.to_thread(self.kokoro_backend.synthesize, text)
-            
+            pcm16_data, native_rate = await self._synthesize_kokoro_pcm16(text)
             if not pcm16_data:
                 logging.warning("⚠️ Kokoro returned empty audio")
                 return b""
 
-            # Convert PCM16 24kHz directly to 8kHz uLaw (no temp WAV file)
+            # Preserve the legacy response contract for clients that did not
+            # negotiate native linear PCM.
             ulaw_data = await asyncio.to_thread(
-                self.audio_processor.pcm16_to_ulaw_8k, pcm16_data, 24000
+                self.audio_processor.pcm16_to_ulaw_8k, pcm16_data, native_rate
             )
 
             logging.info("🔊 TTS RESULT - Kokoro generated uLaw 8kHz audio: %s bytes call_id=%s", len(ulaw_data), _CALL_LOG_CONTEXT.get())
@@ -3224,6 +3342,48 @@ class LocalAIServer:
         except Exception as exc:
             logging.error("Kokoro TTS processing failed: %s", exc, exc_info=True)
             return b""
+
+    @staticmethod
+    def _decode_wav_pcm16_mono(wav_data: bytes) -> Tuple[bytes, int]:
+        """Decode a PCM WAV payload to raw mono PCM16 and its actual rate."""
+        with wave.open(io.BytesIO(wav_data), "rb") as wav_file:
+            pcm_data = wav_file.readframes(wav_file.getnframes())
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            sample_rate = wav_file.getframerate()
+
+        if channels > 1:
+            pcm_data = audioop.tomono(pcm_data, sample_width, 1, 1)
+        if sample_width != 2:
+            pcm_data = audioop.lin2lin(pcm_data, sample_width, 2)
+        return pcm_data, int(sample_rate)
+
+    async def _synthesize_kokoro_pcm16(self, text: str) -> Tuple[bytes, int]:
+        """Return Kokoro local/API audio as raw PCM16 plus its native rate."""
+        if self.kokoro_mode == "api":
+            if not self.kokoro_api_base_url:
+                logging.error("Kokoro API mode selected but KOKORO_API_BASE_URL is empty")
+                return b"", 24000
+            logging.debug(
+                "🔊 TTS INPUT - Kokoro API (%s) voice=%s text='%s'",
+                self.kokoro_api_base_url,
+                self.kokoro_voice,
+                text,
+            )
+            wav_data = await asyncio.to_thread(self._kokoro_api_speech_request, text)
+            if not wav_data:
+                return b"", 24000
+            return await asyncio.to_thread(self._decode_wav_pcm16_mono, wav_data)
+
+        if not self.kokoro_backend:
+            logging.error("Kokoro TTS backend not initialized")
+            return b"", 24000
+
+        native_rate = int(getattr(self.kokoro_backend, "sample_rate", 24000) or 24000)
+        logging.debug("🔊 TTS INPUT - Generating %dHz Kokoro audio for: '%s'", native_rate, text)
+        async with self._tts_lock:
+            pcm16_data = await asyncio.to_thread(self.kokoro_backend.synthesize, text)
+        return pcm16_data, native_rate
 
     def _kokoro_api_speech_request(self, text: str) -> bytes:
         """Blocking HTTP request to Kokoro Web API (OpenAI-compatible audio/speech)."""
@@ -3234,7 +3394,8 @@ class LocalAIServer:
             "model": self.kokoro_api_model,
             "voice": self.kokoro_voice,
             "input": text,
-            # Request WAV so we can feed it directly into sox for ulaw conversion.
+            # Request WAV so the response carries its actual sample rate and can
+            # converge on the same raw-PCM path as local Kokoro.
             "response_format": "wav",
             "speed": 1.0,
         }
@@ -3271,23 +3432,11 @@ class LocalAIServer:
     async def _process_tts_kokoro_api(self, text: str) -> bytes:
         """Process TTS using Kokoro Web API, returning 8kHz µ-law bytes."""
         try:
-            if not self.kokoro_api_base_url:
-                logging.error("Kokoro API mode selected but KOKORO_API_BASE_URL is empty")
+            pcm16_data, native_rate = await self._synthesize_kokoro_pcm16(text)
+            if not pcm16_data:
                 return b""
-
-            logging.debug(
-                "🔊 TTS INPUT - Kokoro API (%s) voice=%s text='%s'",
-                self.kokoro_api_base_url,
-                self.kokoro_voice,
-                text,
-            )
-
-            wav_data = await asyncio.to_thread(self._kokoro_api_speech_request, text)
-            if not wav_data:
-                return b""
-
             ulaw_data = await asyncio.to_thread(
-                self.audio_processor.convert_to_ulaw_8k, wav_data, 24000
+                self.audio_processor.pcm16_to_ulaw_8k, pcm16_data, native_rate
             )
             logging.info(
                 "🔊 TTS RESULT - Kokoro API generated uLaw 8kHz audio: %s bytes call_id=%s",
@@ -5071,7 +5220,7 @@ class LocalAIServer:
                     "tool_path": "terminal_farewell",
                 },
             )
-            audio_response = await self.process_tts(farewell)
+            audio_response = await self._process_session_tts(farewell, session)
             await self._emit_tts_audio(
                 websocket,
                 audio_response,
@@ -5182,7 +5331,11 @@ class LocalAIServer:
             return
 
         tts_text = self._strip_tool_calls_for_tts(llm_response or "")
-        audio_response = await self.process_tts(tts_text) if tts_text else b""
+        audio_response = (
+            await self._process_session_tts(tts_text, session)
+            if tts_text
+            else self._empty_session_tts(session)
+        )
         await self._emit_tts_audio(
             websocket,
             audio_response,
@@ -5225,10 +5378,30 @@ class LocalAIServer:
             payload.update(extra)
         return await self._send_json(websocket, payload)
 
+    async def _process_session_tts(
+        self,
+        text: str,
+        session: SessionContext,
+    ) -> SynthesizedAudio:
+        return await self.process_tts_audio(
+            text,
+            output_encoding=session.tts_output_encoding,
+            output_sample_rate_hz=session.tts_output_sample_rate_hz,
+        )
+
+    @staticmethod
+    def _empty_session_tts(session: SessionContext) -> SynthesizedAudio:
+        """Return an empty marker that retains the negotiated session contract."""
+        return SynthesizedAudio(
+            b"",
+            session.tts_output_encoding,
+            session.tts_output_sample_rate_hz,
+        )
+
     async def _emit_tts_audio(
         self,
         websocket,
-        audio_bytes: bytes,
+        audio: Any,
         session: SessionContext,
         request_id: Optional[str],
         *,
@@ -5239,6 +5412,14 @@ class LocalAIServer:
         is_streaming: bool = False,
         generation: Optional[int] = None,
     ) -> None:
+        if isinstance(audio, SynthesizedAudio):
+            audio_bytes = audio.data
+            audio_encoding = audio.encoding
+            audio_sample_rate_hz = audio.sample_rate_hz
+        else:
+            audio_bytes = bytes(audio or b"")
+            audio_encoding = "mulaw"
+            audio_sample_rate_hz = ULAW_SAMPLE_RATE
         if not self._output_generation_active(session, generation):
             self._log_stale_output_drop(session, output_type="tts_audio", generation=generation)
             return
@@ -5253,28 +5434,36 @@ class LocalAIServer:
         # Whisper-family STT, causing talk-loops. We proactively suppress STT for
         # (estimated playback duration + small grace) whenever we emit agent audio.
         self._arm_whisper_stt_suppression(
-            session, audio_bytes, source=source_mode, is_streaming=is_streaming,
+            session,
+            audio_bytes,
+            source=source_mode,
+            is_streaming=is_streaming,
+            encoding=audio_encoding,
+            sample_rate_hz=audio_sample_rate_hz,
         )
+        # Every binary payload must be scoped by a preceding metadata frame.
+        # Continuous full-local audio requests do not carry request IDs, and
+        # omitting this header makes the engine reject otherwise valid audio as
+        # unscoped/stale.  ``request_id`` remains optional in the protocol.
+        metadata = {
+            "type": "tts_audio",
+            "call_id": session.call_id,
+            "mode": source_mode,
+            "encoding": audio_encoding,
+            "sample_rate_hz": audio_sample_rate_hz,
+            "byte_length": len(audio_bytes or b""),
+        }
         if request_id:
-            # Milestone7: emit metadata event for selective TTS while keeping binary transport.
-            metadata = {
-                "type": "tts_audio",
-                "call_id": session.call_id,
-                "mode": source_mode,
-                "request_id": request_id,
-                "encoding": "mulaw",
-                "sample_rate_hz": ULAW_SAMPLE_RATE,
-                "byte_length": len(audio_bytes or b""),
-            }
-            # Multi-chunk streaming metadata (v2 extension, backward-compatible)
-            if utterance_id is not None:
-                metadata["utterance_id"] = utterance_id
-            if chunk_index is not None:
-                metadata["chunk_index"] = chunk_index
-            if is_final_chunk is not None:
-                metadata["is_final"] = is_final_chunk
-            if not await self._send_json(websocket, metadata):
-                return
+            metadata["request_id"] = request_id
+        # Multi-chunk streaming metadata (v2 extension, backward-compatible)
+        if utterance_id is not None:
+            metadata["utterance_id"] = utterance_id
+        if chunk_index is not None:
+            metadata["chunk_index"] = chunk_index
+        if is_final_chunk is not None:
+            metadata["is_final"] = is_final_chunk
+        if not await self._send_json(websocket, metadata):
+            return
         if audio_bytes:
             await self._send_bytes(websocket, audio_bytes)
 
@@ -5285,6 +5474,8 @@ class LocalAIServer:
         *,
         source: str,
         is_streaming: bool = False,
+        encoding: str = "mulaw",
+        sample_rate_hz: int = ULAW_SAMPLE_RATE,
     ) -> None:
         _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
         if self.stt_backend not in {"faster_whisper", "whisper_cpp"} and not _sherpa_offline:
@@ -5292,7 +5483,10 @@ class LocalAIServer:
         if not audio_bytes:
             return
 
-        duration_s = float(len(audio_bytes)) / float(max(1, ULAW_SAMPLE_RATE))
+        bytes_per_sample = 2 if encoding == "linear16" else 1
+        duration_s = float(len(audio_bytes)) / float(
+            max(1, sample_rate_hz * bytes_per_sample)
+        )
         grace_s = 0.25
         if is_streaming:
             # For multi-chunk streaming, stack chunk durations on top of existing
@@ -5704,9 +5898,9 @@ class LocalAIServer:
             # Strip tool call markup before TTS to avoid speaking <tool_call>...</tool_call>
             tts_text = self._strip_tool_calls_for_tts(llm_response)
             if tts_text:
-                audio_response = await self.process_tts(tts_text)
+                audio_response = await self._process_session_tts(tts_text, session)
             else:
-                audio_response = b""  # No spoken text, just tool call
+                audio_response = self._empty_session_tts(session)
             await self._emit_tts_audio(
                 websocket,
                 audio_response,
@@ -5772,7 +5966,7 @@ class LocalAIServer:
                     if to_speak:
                         tts_text = self._strip_tool_calls_for_tts(to_speak)
                         if tts_text:
-                            audio = await self.process_tts(tts_text)
+                            audio = await self._process_session_tts(tts_text, session)
                             if audio:
                                 await self._emit_tts_audio(
                                     websocket, audio, session, request_id,
@@ -5790,7 +5984,7 @@ class LocalAIServer:
             if remainder:
                 tts_text = self._strip_tool_calls_for_tts(remainder)
                 if tts_text:
-                    audio = await self.process_tts(tts_text)
+                    audio = await self._process_session_tts(tts_text, session)
                     if audio:
                         await self._emit_tts_audio(
                             websocket, audio, session, request_id,
@@ -5807,7 +6001,11 @@ class LocalAIServer:
             if chunk_index > 0 and not remainder:
                 # Re-emit a zero-byte final marker so the client knows the utterance ended
                 await self._emit_tts_audio(
-                    websocket, b"", session, request_id,
+                    websocket, SynthesizedAudio(
+                        b"",
+                        session.tts_output_encoding,
+                        session.tts_output_sample_rate_hz,
+                    ), session, request_id,
                     source_mode="full",
                     utterance_id=utterance_id,
                     chunk_index=chunk_index,
@@ -5821,7 +6019,7 @@ class LocalAIServer:
             if chunk_index == 0 and full_response.strip():
                 tts_text = self._strip_tool_calls_for_tts(full_response)
                 if tts_text:
-                    audio = await self.process_tts(tts_text)
+                    audio = await self._process_session_tts(tts_text, session)
                     if audio:
                         await self._emit_tts_audio(
                             websocket, audio, session, request_id,
@@ -5839,7 +6037,7 @@ class LocalAIServer:
             if full_response.strip() and chunk_index == 0:
                 tts_text = self._strip_tool_calls_for_tts(full_response)
                 if tts_text:
-                    audio = await self.process_tts(tts_text)
+                    audio = await self._process_session_tts(tts_text, session)
                     if audio:
                         await self._emit_tts_audio(
                             websocket, audio, session, request_id,
@@ -6133,28 +6331,33 @@ class LocalAIServer:
 
         generation = self._start_output_generation(session)
 
-        audio_response = await self.process_tts(text)
+        audio_response = await self._process_session_tts(text, session)
         if not self._output_generation_active(session, generation):
             self._log_stale_output_drop(session, output_type="tts_response", generation=generation)
             return
-        self._arm_whisper_stt_suppression(session, audio_response, source="tts_request")
-        
         # Check if this is a direct TTS request (expects tts_response with base64)
         # vs streaming mode which uses binary frames
         response_format = data.get("response_format", "json")  # "json" or "binary"
         
         if response_format == "json" or data.get("type") == "tts_request":
+            self._arm_whisper_stt_suppression(
+                session,
+                audio_response.data,
+                source="tts_request",
+                encoding=audio_response.encoding,
+                sample_rate_hz=audio_response.sample_rate_hz,
+            )
             # Send JSON response with base64-encoded audio for direct TTS calls
             # This is what LocalProvider.text_to_speech expects
-            audio_b64 = base64.b64encode(audio_response).decode("utf-8") if audio_response else ""
+            audio_b64 = base64.b64encode(audio_response.data).decode("utf-8") if audio_response else ""
             response = {
                 "type": "tts_response",
                 "text": text,
                 "call_id": session.call_id,
                 "audio_data": audio_b64,
-                "encoding": "mulaw",
-                "sample_rate_hz": ULAW_SAMPLE_RATE,
-                "byte_length": len(audio_response or b""),
+                "encoding": audio_response.encoding,
+                "sample_rate_hz": audio_response.sample_rate_hz,
+                "byte_length": len(audio_response.data),
             }
             if request_id:
                 response["request_id"] = request_id
@@ -6162,7 +6365,13 @@ class LocalAIServer:
                 self._log_stale_output_drop(session, output_type="tts_response", generation=generation)
                 return
             await self._send_json(websocket, response)
-            logging.info("📢 TTS response sent call_id=%s audio_bytes=%d", session.call_id, len(audio_response or b""))
+            logging.info(
+                "📢 TTS response sent call_id=%s audio_bytes=%d encoding=%s sample_rate_hz=%s",
+                session.call_id,
+                len(audio_response.data),
+                audio_response.encoding,
+                audio_response.sample_rate_hz,
+            )
         else:
             # Legacy binary streaming mode
             await self._emit_tts_audio(

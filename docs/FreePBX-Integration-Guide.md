@@ -364,6 +364,17 @@ exten => s,1,NoOp(AI Agent - Wideband Profile)
  same => n,Hangup()
 ```
 
+For AudioSocket, `wideband_pcm_16k` requires Asterisk 20.17+, 21.12+, 22.7+,
+or 23.1+ and a wideband endpoint leg such as G.722. The engine verifies the
+Asterisk version through ARI and rejects an incompatible wideband call cleanly.
+For a SIP trunk, confirm that the provider and the negotiated trunk leg both
+support G.722 before assigning the profile. This profile does not improve a
+PSTN/G.711 leg, which remains limited to 8 kHz.
+
+`wideband_pcm_16k` is not supported with ExternalMedia RTP. Use
+`telephony_ulaw_8k` or `telephony_enhanced_8k` for ExternalMedia, or switch the
+global transport to AudioSocket before assigning the wideband profile.
+
 ### 3.4 Advanced: Agent-Based Routing (No Provider Override)
 
 Use `AI_AGENT` alone to select an agent and change greeting/prompt while keeping the default provider (`local_hybrid`). `AI_CONTEXT` is also accepted (legacy, equivalent).

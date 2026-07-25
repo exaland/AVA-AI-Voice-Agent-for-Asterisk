@@ -840,6 +840,7 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             "result": result,  # preserve falsy values; do NOT coerce to {}
             "is_error": bool(is_error),
             "tool_policy": self._effective_tool_policy,
+            **self._tts_output_preferences(),
         }
         try:
             await self.websocket.send(json.dumps(payload, default=str))
@@ -864,14 +865,48 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
     def supported_codecs(self) -> List[str]:
         return ["ulaw"]
 
+    def _tts_output_preferences(self) -> Dict[str, Any]:
+        config = getattr(self, "config", None)
+        target_encoding = str(
+            getattr(config, "target_encoding", "mulaw") or "mulaw"
+        ).strip().lower()
+        signed_linear = target_encoding in {"linear16", "pcm16", "slin16", "slin"}
+        default_rate = 16000 if target_encoding in {"linear16", "pcm16", "slin16"} else 8000
+        try:
+            sample_rate = int(
+                getattr(config, "target_sample_rate_hz", default_rate)
+                or default_rate
+            )
+        except (TypeError, ValueError):
+            sample_rate = default_rate
+
+        # The Local AI Server's native output contracts are μ-law/8 kHz and
+        # linear PCM/16 kHz.  AudioSocket's legacy ``slin`` carrier is PCM at
+        # 8 kHz, but requesting ``linear16@8000`` from the server is invalid;
+        # retain the legacy μ-law response and let the engine perform the
+        # established μ-law -> slin wire conversion.
+        if signed_linear and sample_rate == 16000:
+            encoding = "linear16"
+        else:
+            encoding = "mulaw"
+            sample_rate = 8000
+        return {
+            "output_encoding": encoding,
+            "output_sample_rate_hz": sample_rate,
+        }
+
     def get_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             input_encodings=["pcm16"],
             input_sample_rates_hz=[16000],
-            output_encodings=["ulaw"],
-            output_sample_rates_hz=[8000],
+            output_encodings=["ulaw", "linear16"],
+            output_sample_rates_hz=[8000, 16000],
             is_full_agent=True,
             requires_continuous_audio=True,
+            wideband_input_encoding="pcm16",
+            wideband_input_sample_rate_hz=16000,
+            wideband_output_encoding="linear16",
+            wideband_output_sample_rate_hz=16000,
         )
 
     def is_ready(self) -> bool:
@@ -1649,7 +1684,8 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                     "rate": 16000,
                     "format": "pcm16le",
                     "call_id": self._active_call_id,
-                    "mode": self._mode  # "stt" for hybrid, "full" for all-local
+                    "mode": self._mode,  # "stt" for hybrid, "full" for all-local
+                    **self._tts_output_preferences(),
                 })
                 try:
                     await self.websocket.send(msg)
@@ -1814,6 +1850,7 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                 "type": "tts_request",
                 "call_id": call_id,
                 "text": greeting_text,
+                **self._tts_output_preferences(),
             }
 
             await self.websocket.send(json.dumps(tts_message))
@@ -2319,6 +2356,7 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                         "type": "tts_request",
                         "text": text,
                         "call_id": self._active_call_id or "announcement",
+                        **self._tts_output_preferences(),
                     }
                 )
             )
@@ -2347,7 +2385,8 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             tts_message = {
                 "type": "tts_request",
                 "text": text,
-                "call_id": self._active_call_id or "greeting"
+                "call_id": self._active_call_id or "greeting",
+                **self._tts_output_preferences(),
             }
             
             await self.websocket.send(json.dumps(tts_message))

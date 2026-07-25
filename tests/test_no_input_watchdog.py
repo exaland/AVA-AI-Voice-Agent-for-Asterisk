@@ -353,6 +353,48 @@ async def test_talk_detect_after_post_tts_guard_pauses_no_input_watchdog():
 
 
 @pytest.mark.asyncio
+async def test_talk_detect_rechecks_gating_after_async_cleanup_race():
+    """An echo event queued during TTS must not interrupt after TTS ends."""
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.config = SimpleNamespace(
+        barge_in=SimpleNamespace(
+            enabled=True,
+            post_tts_end_protection_ms=600,
+            talk_detect_initial_protection_ms=0,
+            cooldown_ms=0,
+        )
+    )
+    engine._no_input_note_input_state = AsyncMock()
+    engine._apply_barge_in_action = AsyncMock()
+    engine._save_session = AsyncMock()
+    session = CallSession(
+        call_id="call-stale-talk-detect",
+        caller_channel_id="channel-stale-talk-detect",
+    )
+    session.audio_capture_enabled = False
+    session.tts_playing = True
+    session.tts_started_ts = time.time() - 2.0
+    await engine.session_store.upsert_call(session)
+
+    async def finish_playback_during_handler(*_args, **_kwargs):
+        session.tts_playing = False
+        session.audio_capture_enabled = True
+        session.tts_ended_ts = time.time()
+
+    engine._no_input_note_activity = AsyncMock(
+        side_effect=finish_playback_during_handler
+    )
+
+    await engine._handle_channel_talking_started(
+        {"channel": {"id": session.caller_channel_id}}
+    )
+
+    engine._apply_barge_in_action.assert_not_awaited()
+    engine._no_input_note_input_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_no_input_provider_output_drains_without_resetting_policy_state():
     engine = Engine.__new__(Engine)
     engine.session_store = SessionStore()
@@ -408,6 +450,88 @@ async def test_no_input_provider_output_drains_without_resetting_policy_state():
         "reset_timer": True,
         "preserve_policy_state": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_greeting_gating_is_released_only_after_transport_drain():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.conversation_coordinator = ConversationCoordinator(engine.session_store)
+    engine._call_bg_tasks = {}
+    engine._provider_output_operations = {}
+    engine._provider_output_drain_tasks = {}
+    engine._agent_output_active_calls = set()
+    greeting_provider = SimpleNamespace(
+        release_greeting_transport_guard=AsyncMock(),
+    )
+    engine._call_providers = {"call-openai-greeting-tail": greeting_provider}
+    engine.config = SimpleNamespace(audio_transport="audiosocket")
+    engine.no_input_watchdog = SimpleNamespace(
+        note_agent_output_start=AsyncMock(),
+        note_agent_output_end=AsyncMock(),
+    )
+    engine._save_session = AsyncMock()
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    async def wait_for_drain(_call_id, **_kwargs):
+        drain_started.set()
+        await release_drain.wait()
+        return True
+
+    engine._wait_for_call_audio_drain = wait_for_drain
+    session = CallSession(
+        call_id="call-openai-greeting-tail",
+        caller_channel_id="channel-openai-greeting-tail",
+    )
+    await engine.session_store.upsert_call(session)
+    await engine.conversation_coordinator.on_tts_start(
+        session.call_id,
+        "stream:greeting",
+    )
+    await engine.conversation_coordinator.on_tts_start(
+        session.call_id,
+        "tts_segment:call-openai-greeting-tail",
+    )
+
+    await engine._note_provider_output_start(session.call_id)
+    await engine._note_provider_output_end(
+        session.call_id,
+        session,
+        clear_tts_gating_after_drain=True,
+    )
+    await asyncio.wait_for(drain_started.wait(), timeout=0.2)
+
+    during = await engine.session_store.get_by_call_id(session.call_id)
+    assert during.audio_capture_enabled is False
+    assert during.tts_tokens == {
+        "stream:greeting",
+        "tts_segment:call-openai-greeting-tail",
+    }
+
+    # A later playback token must not be swept up by the deferred greeting
+    # release if a new response starts while the drain observer is settling.
+    await engine.conversation_coordinator.on_tts_start(
+        session.call_id,
+        "stream:next-response",
+    )
+    release_drain.set()
+    await _wait_until(
+        lambda: not engine._provider_output_drain_tasks.get(session.call_id)
+    )
+
+    after = await engine.session_store.get_by_call_id(session.call_id)
+    assert after.audio_capture_enabled is False
+    assert after.tts_tokens == {"stream:next-response"}
+    greeting_provider.release_greeting_transport_guard.assert_awaited_once_with()
+
+    await engine.conversation_coordinator.on_tts_end(
+        session.call_id,
+        "stream:next-response",
+    )
+    final = await engine.session_store.get_by_call_id(session.call_id)
+    assert final.audio_capture_enabled is True
+    assert final.tts_tokens == set()
 
 
 @pytest.mark.asyncio

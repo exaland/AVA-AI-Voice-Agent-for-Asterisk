@@ -476,6 +476,42 @@ class DeepgramProvider(AIProviderInterface):
         """Set the session store for turn latency tracking (Milestone 21)."""
         self._session_store = session_store
 
+    async def _handle_user_started_speaking(self) -> None:
+        """Bridge Deepgram's native VAD signal into platform playback flush.
+
+        Deepgram owns response cancellation and turn-taking.  The engine still
+        owns AudioSocket/ARI playback buffers, so it needs an explicit
+        ``ProviderBargeIn`` event to discard audio already queued locally.
+        """
+        logger.info(
+            "🎤 Deepgram UserStartedSpeaking",
+            call_id=self.call_id,
+            request_id=getattr(self, "request_id", None),
+        )
+        if not self.on_event:
+            return
+        if self.terminal_output_protected:
+            logger.info(
+                "Deepgram provider barge-in suppressed during terminal farewell",
+                call_id=self.call_id,
+            )
+            return
+        try:
+            await self.on_event(
+                {
+                    "type": "ProviderBargeIn",
+                    "call_id": self.call_id,
+                    "provider": self.provider_event_name(),
+                    "event": "UserStartedSpeaking",
+                }
+            )
+        except Exception:
+            logger.debug(
+                "Failed to emit Deepgram ProviderBargeIn",
+                call_id=self.call_id,
+                exc_info=True,
+            )
+
     @property
     def supported_codecs(self) -> List[str]:
         return ["ulaw"]
@@ -491,8 +527,8 @@ class DeepgramProvider(AIProviderInterface):
             # Audio format capabilities
             input_encodings=["mulaw", "linear16"],
             input_sample_rates_hz=[8000, 16000],
-            output_encodings=["mulaw"],
-            output_sample_rates_hz=[8000],
+            output_encodings=["linear16", "mulaw"],
+            output_sample_rates_hz=[16000, 24000, 8000],
             preferred_chunk_ms=20,
             can_negotiate=True,  # Uses SettingsApplied ACK for runtime negotiation
             # Provider type and audio processing capabilities
@@ -500,6 +536,10 @@ class DeepgramProvider(AIProviderInterface):
             has_native_vad=True,  # Deepgram Voice Agent has built-in VAD
             has_native_barge_in=True,  # Handles interruptions internally
             requires_continuous_audio=True,  # Needs continuous audio for VAD
+            wideband_input_encoding="linear16",
+            wideband_input_sample_rate_hz=16000,
+            wideband_output_encoding="linear16",
+            wideband_output_sample_rate_hz=16000,
         )
     
     def parse_ack(self, event_data: Dict[str, Any]) -> Optional[ProviderCapabilities]:
@@ -659,9 +699,23 @@ class DeepgramProvider(AIProviderInterface):
         # Derive codec settings from config with safe defaults
         input_encoding = self._get_config_value('input_encoding', None) or 'ulaw'
         input_sample_rate = int(self._get_config_value('input_sample_rate_hz', 8000) or 8000)
-        # Choose output based on voice capabilities (fallback to configured defaults)
-        output_encoding = self._original_output_encoding
-        output_sample_rate = int(self._original_output_rate or 8000)
+        # Per-call transport overrides are applied after this provider instance
+        # is constructed. Read the live config here instead of the constructor
+        # snapshot so an Agent selecting wideband_pcm_16k actually requests
+        # linear16/16 kHz from Deepgram. Keep the resolved values as the session
+        # baseline for ACK/autodetect handling below.
+        output_encoding = (
+            self._get_config_value('output_encoding', self._original_output_encoding)
+            or self._original_output_encoding
+            or 'mulaw'
+        )
+        output_sample_rate = int(
+            self._get_config_value('output_sample_rate_hz', self._original_output_rate)
+            or self._original_output_rate
+            or 8000
+        )
+        self._original_output_encoding = output_encoding
+        self._original_output_rate = output_sample_rate
         self._dg_output_encoding = self._canonicalize_encoding(output_encoding)
         self._dg_output_rate = output_sample_rate
         self._dg_output_inferred = not self.allow_output_autodetect
@@ -823,7 +877,12 @@ class DeepgramProvider(AIProviderInterface):
             self._last_settings_minimal = {
                 "type": "Settings",
                 "audio": {
-                    "input": { "encoding": input_format, "sample_rate": int(input_sample_rate) }
+                    "input": { "encoding": input_format, "sample_rate": int(input_sample_rate) },
+                    "output": {
+                        "encoding": self._dg_output_encoding,
+                        "sample_rate": self._dg_output_rate,
+                        "container": "none",
+                    },
                 },
                 "agent": {
                     "greeting": greeting_val,
@@ -1522,11 +1581,7 @@ class DeepgramProvider(AIProviderInterface):
                                     session_id=getattr(self, "session_id", None),
                                 )
                             elif et == "UserStartedSpeaking":
-                                logger.info(
-                                    "🎤 Deepgram UserStartedSpeaking",
-                                    call_id=self.call_id,
-                                    request_id=getattr(self, "request_id", None),
-                                )
+                                await self._handle_user_started_speaking()
                             elif et == "UserStoppedSpeaking":
                                 logger.info(
                                     "🔇 Deepgram UserStoppedSpeaking",

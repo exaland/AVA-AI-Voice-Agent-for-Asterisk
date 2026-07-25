@@ -217,6 +217,18 @@ const ProfilesPage = () => {
         setProfileForm({ ...profileForm, [field]: value });
     };
 
+    const updateOptionalProfileNumber = (field: string, rawValue: string) => {
+        setProfileForm((current) => {
+            const next = { ...current };
+            if (rawValue.trim() === '') {
+                delete next[field];
+            } else {
+                next[field] = parseInt(rawValue, 10);
+            }
+            return next;
+        });
+    };
+
     const updateNestedField = (section: string, field: string, value: any) => {
         setProfileForm({
             ...profileForm,
@@ -251,9 +263,10 @@ const ProfilesPage = () => {
             .filter(Boolean);
     };
 
-    const getProfileSupport = (profileName: string, profile: any): 'ga' | 'enhanced' | 'experimental' | 'provider-native' | 'custom' => {
+    const getProfileSupport = (profileName: string, profile: any): 'ga' | 'enhanced' | 'wideband' | 'experimental' | 'provider-native' | 'custom' => {
         if (profileName === 'telephony_enhanced_8k') return 'enhanced';
         if (profileName === 'telephony_ulaw_8k' || profileName === 'telephony_responsive') return 'ga';
+        if (profileName === 'wideband_pcm_16k') return 'wideband';
         const wireRate = Number(profile?.transport_out?.sample_rate_hz || 0);
         if (wireRate > 8000) return 'experimental';
         const providerRate = Number(profile?.provider_pref?.output_sample_rate_hz || profile?.internal_rate_hz || 0);
@@ -267,7 +280,7 @@ const ProfilesPage = () => {
             'telephony_responsive': 'GA 8 kHz telephony transport with adaptive timing',
             'telephony_ulaw_8k': 'GA 8 kHz telephony transport matching G.711 μ-law',
             'telephony_enhanced_8k': 'Opt-in 8 kHz telephony with alias-safe downsampling for clearer 16/24 kHz provider audio',
-            'wideband_pcm_16k': 'Experimental 16 kHz wire transport; requires an end-to-end wideband call path',
+            'wideband_pcm_16k': 'Opt-in 16 kHz AudioSocket transport with provider-native PCM conversion; use only with a G.722 or other end-to-end wideband call path',
             'openai_realtime_24k': 'Experimental profile with 24 kHz provider-native processing and an 8 kHz Asterisk wire leg'
         };
         return descriptions[profileName] || 'Custom audio profile';
@@ -486,6 +499,8 @@ const ProfilesPage = () => {
                                                         ? 'bg-green-500/15 text-green-700 dark:text-green-300'
                                                         : support === 'enhanced'
                                                             ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300'
+                                                        : support === 'wideband'
+                                                            ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
                                                         : support === 'experimental' || support === 'provider-native'
                                                             ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
                                                             : 'bg-secondary text-muted-foreground'
@@ -494,6 +509,8 @@ const ProfilesPage = () => {
                                                         ? 'GA Telephony'
                                                         : support === 'enhanced'
                                                             ? 'Enhanced Telephony'
+                                                        : support === 'wideband'
+                                                            ? 'Opt-in Wideband · Asterisk 20.17+'
                                                         : support === 'experimental'
                                                             ? 'Experimental Wideband'
                                                             : support === 'provider-native'
@@ -551,7 +568,7 @@ const ProfilesPage = () => {
 	                                    </div>
 	                                </div>
 
-                                <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+                                <div className="grid grid-cols-2 md:grid-cols-6 gap-3 text-sm">
                                     <div className="bg-secondary/30 p-2 rounded-md">
                                         <span className="font-medium text-xs uppercase tracking-wider text-muted-foreground block">Internal Rate</span>
                                         <p className="text-foreground font-mono">{profile.internal_rate_hz || 8000} Hz</p>
@@ -572,6 +589,12 @@ const ProfilesPage = () => {
                                         <span className="font-medium text-xs uppercase tracking-wider text-muted-foreground block">Downsampling</span>
                                         <p className="text-foreground font-mono">
                                             {profile.output_resampler === 'bandlimited' ? 'Alias-safe' : 'Compatibility'}
+                                        </p>
+                                    </div>
+                                    <div className="bg-secondary/30 p-2 rounded-md">
+                                        <span className="font-medium text-xs uppercase tracking-wider text-muted-foreground block">Barge DSP</span>
+                                        <p className="text-foreground font-mono">
+                                            {profile.talk_detect_talking_threshold ?? config.barge_in?.pipeline_talk_detect_talking_threshold ?? 256}
                                         </p>
                                     </div>
                                 </div>
@@ -679,6 +702,15 @@ const ProfilesPage = () => {
                                 onChange={(e) => updateProfileField('internal_rate_hz', parseInt(e.target.value))}
                                 tooltip="Processing sample rate (8000, 16000, 24000)."
                             />
+                            <FormInput
+                                label="TALK_DETECT Talking Threshold"
+                                type="number"
+                                min={1}
+                                max={32768}
+                                value={profileForm.talk_detect_talking_threshold ?? config.barge_in?.pipeline_talk_detect_talking_threshold ?? 256}
+                                onChange={(e) => updateOptionalProfileNumber('talk_detect_talking_threshold', e.target.value)}
+                                tooltip="Per-profile Asterisk DSP magnitude threshold for pipeline barge-in. Higher values reject more playback echo. The wideband profile uses 1000; profiles without an override inherit the global barge-in value."
+                            />
                             <FormSelect
                                 label="Output Downsampling"
                                 value={profileForm.output_resampler || 'linear'}
@@ -748,7 +780,7 @@ const ProfilesPage = () => {
                                     { value: 'slin16', label: 'SLIN16 (16kHz)' },
                                     { value: 'ulaw', label: 'μ-law' }
                                 ]}
-                                tooltip="Encoding written back to the Asterisk ExternalMedia socket. SLIN/SLIN16 are 16-bit linear PCM; μ-law is the PSTN-native G.711 codec."
+                                tooltip="Encoding written to the selected Asterisk media transport. SLIN16 wideband is supported through AudioSocket; ExternalMedia RTP uses the 8 kHz telephony profiles."
                             />
                             <FormInput
                                 label="Sample Rate (Hz)"

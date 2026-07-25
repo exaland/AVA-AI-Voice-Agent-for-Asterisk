@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sys
 import threading
 from pathlib import Path
@@ -46,6 +47,55 @@ async def test_closed_session_drops_llm_and_tts_output():
 
 
 @pytest.mark.asyncio
+async def test_full_local_audio_without_request_id_is_scoped_by_metadata():
+    server_mod = _load("server")
+    session_mod = _load("session")
+    audio_mod = _load("audio_processor")
+    instance = object.__new__(server_mod.LocalAIServer)
+    instance.config = type("Config", (), {})()
+    instance.stt_backend = "vosk"
+    instance.sherpa_backend = None
+    instance.tone_backend = None
+    session = session_mod.SessionContext(call_id="full-local")
+    ws = _WebSocket()
+
+    await instance._emit_tts_audio(
+        ws,
+        audio_mod.SynthesizedAudio(b"reply", "mulaw", 8000),
+        session,
+        None,
+        source_mode="full",
+    )
+
+    assert json.loads(ws.sent[0]) == {
+        "type": "tts_audio",
+        "call_id": "full-local",
+        "mode": "full",
+        "encoding": "mulaw",
+        "sample_rate_hz": 8000,
+        "byte_length": 5,
+    }
+    assert ws.sent[1] == b"reply"
+
+
+def test_empty_session_tts_marker_preserves_wideband_contract():
+    server_mod = _load("server")
+    session_mod = _load("session")
+    instance = object.__new__(server_mod.LocalAIServer)
+    session = session_mod.SessionContext(
+        call_id="wideband-empty",
+        tts_output_encoding="linear16",
+        tts_output_sample_rate_hz=16000,
+    )
+
+    audio = instance._empty_session_tts(session)
+
+    assert audio.data == b""
+    assert audio.encoding == "linear16"
+    assert audio.sample_rate_hz == 16000
+
+
+@pytest.mark.asyncio
 async def test_barge_in_generation_drops_completed_tts_request():
     server_mod = _load("server")
     session_mod = _load("session")
@@ -56,12 +106,14 @@ async def test_barge_in_generation_drops_completed_tts_request():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_tts(_text):
+    audio_mod = _load("audio_processor")
+
+    async def slow_tts(_text, _session):
         started.set()
         await release.wait()
-        return b"audio"
+        return audio_mod.SynthesizedAudio(b"audio")
 
-    instance.process_tts = slow_tts
+    instance._process_session_tts = slow_tts
     session = session_mod.SessionContext(call_id="call-1", mode="tts")
     ws = _WebSocket()
     task = asyncio.create_task(instance._handle_tts_request(

@@ -57,6 +57,11 @@ from .logging_config import get_logger, configure_logging
 from .live_status_publisher import LiveStatusPublisher, live_status_component
 from .rtp_server import RTPServer
 from .audio.audiosocket_server import AudioSocketServer
+from .audio.audiosocket_protocol import (
+    AudioSocketAudioFrame,
+    normalize_slin_format,
+    supports_multirate_audiosocket,
+)
 from .audio.resampler import resample_audio, resolve_output_resampler_policy
 from .providers.base import AIProviderInterface
 from .providers.deepgram import DeepgramProvider
@@ -1336,7 +1341,13 @@ class Engine:
             if watchdog is not None:
                 await watchdog.note_agent_output_start(call_id)
 
-    async def _note_provider_output_end(self, call_id: str, session: Optional[CallSession]) -> None:
+    async def _note_provider_output_end(
+        self,
+        call_id: str,
+        session: Optional[CallSession],
+        *,
+        clear_tts_gating_after_drain: bool = False,
+    ) -> None:
         """Observe generation completion and defer idle timing until transport drain."""
         operations = getattr(self, "_provider_output_operations", {})
         operation = operations.get(call_id)
@@ -1355,9 +1366,20 @@ class Engine:
         except Exception:
             logger.debug("Failed clearing provider silence-turn marker", call_id=call_id, exc_info=True)
 
+        deferred_tts_tokens: Tuple[str, ...] = ()
+        if clear_tts_gating_after_drain:
+            deferred_tts_tokens = tuple(
+                getattr(session, "tts_tokens", set()) or ()
+            )
+
         active = getattr(self, "_agent_output_active_calls", set())
         watchdog = getattr(self, "no_input_watchdog", None)
         if call_id not in active:
+            if clear_tts_gating_after_drain:
+                await self._clear_tts_gating_after_provider_drain(
+                    call_id,
+                    deferred_tts_tokens,
+                )
             if watchdog is not None:
                 await watchdog.note_agent_output_end(
                     call_id,
@@ -1383,6 +1405,8 @@ class Engine:
                 call_id,
                 reset_timer=reset_timer,
                 preserve_policy_state=preserve_policy_state,
+                clear_tts_gating_after_drain=clear_tts_gating_after_drain,
+                deferred_tts_tokens=deferred_tts_tokens,
             ),
             name=f"provider-output-drain-{call_id}",
         )
@@ -1394,6 +1418,8 @@ class Engine:
         *,
         reset_timer: bool,
         preserve_policy_state: bool,
+        clear_tts_gating_after_drain: bool = False,
+        deferred_tts_tokens: Tuple[str, ...] = (),
     ) -> None:
         """Clear provider-output state only after queued caller audio is emitted."""
         current_task = asyncio.current_task()
@@ -1419,6 +1445,11 @@ class Engine:
         session = await self.session_store.get_by_call_id(call_id)
         if not session or bool(getattr(session, "cleanup_in_progress", False)):
             return
+        if clear_tts_gating_after_drain:
+            await self._clear_tts_gating_after_provider_drain(
+                call_id,
+                deferred_tts_tokens,
+            )
         watchdog = getattr(self, "no_input_watchdog", None)
         if watchdog is not None:
             await watchdog.note_agent_output_end(
@@ -1432,6 +1463,50 @@ class Engine:
             audio_drained=drained,
             reset_timer=reset_timer,
             preserve_policy_state=preserve_policy_state,
+        )
+
+    async def _clear_tts_gating_after_provider_drain(
+        self,
+        call_id: str,
+        tokens: Tuple[str, ...],
+    ) -> None:
+        """Release greeting echo protection after caller-facing audio is quiet."""
+        session = await self.session_store.get_by_call_id(call_id)
+        if not session or bool(getattr(session, "cleanup_in_progress", False)):
+            return
+        try:
+            provider = getattr(self, "_call_providers", {}).get(call_id)
+            release_guard = getattr(provider, "release_greeting_transport_guard", None)
+            if callable(release_guard):
+                await release_guard()
+        except Exception:
+            logger.debug(
+                "Failed releasing provider greeting transport guard",
+                call_id=call_id,
+                exc_info=True,
+            )
+        for token in tokens:
+            try:
+                if self.conversation_coordinator:
+                    await self.conversation_coordinator.on_tts_end(
+                        call_id,
+                        token,
+                        reason="provider-output-drained",
+                        notify_no_input=False,
+                    )
+                else:
+                    await self.session_store.clear_gating_token(call_id, token)
+            except Exception:
+                logger.debug(
+                    "Failed clearing deferred TTS gating after provider drain",
+                    call_id=call_id,
+                    token=token,
+                    exc_info=True,
+                )
+        logger.info(
+            "Deferred TTS gating cleared after provider drain",
+            call_id=call_id,
+            token_count=len(tokens),
         )
 
     async def _no_input_should_pause(self, call_id: str) -> bool:
@@ -7100,6 +7175,106 @@ class Engine:
                 # slow consumer keeps draining; a cancelled/replaced stream exits.
                 continue
 
+    def _pipeline_tts_uses_streaming(self, pipeline: Any) -> bool:
+        """Resolve the pipeline TTS delivery mode for every response path."""
+        override = (
+            getattr(pipeline.tts_adapter, "downstream_mode_override", "auto")
+            or "auto"
+        )
+        if override == "stream":
+            return True
+        if override == "file":
+            return False
+        return self.config.downstream_mode != "file"
+
+    @staticmethod
+    def _pipeline_tts_source_format(pipeline: Any) -> Tuple[str, int]:
+        """Return the adapter audio format used as the streaming source."""
+        tts_format = (pipeline.tts_options or {}).get("format")
+        if not isinstance(tts_format, dict):
+            tts_format = (pipeline.tts_options or {}).get("target_format")
+        if not isinstance(tts_format, dict):
+            tts_format = {}
+        encoding = str(
+            tts_format.get("encoding") or tts_format.get("format") or "mulaw"
+        )
+        try:
+            sample_rate = int(
+                tts_format.get("sample_rate")
+                or tts_format.get("sample_rate_hz")
+                or 8000
+            )
+        except (TypeError, ValueError):
+            sample_rate = 8000
+        return encoding, sample_rate
+
+    async def _stream_pipeline_tts_text(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        text: str,
+        *,
+        playback_type: str = "pipeline-tts",
+    ) -> Optional[str]:
+        """Synthesize one pipeline response onto the call-owned media stream.
+
+        Tool-result continuations historically bypassed this path and handed
+        PCM16/16 kHz bytes to the file player as if they were μ-law/8 kHz. Keep
+        continuations on the same negotiated AudioSocket stream as ordinary
+        pipeline replies and wait for the stream to drain before proceeding.
+        """
+        stream_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        source_encoding, source_rate = self._pipeline_tts_source_format(pipeline)
+        stream_id = await self.streaming_playback_manager.start_streaming_playback(
+            call_id,
+            stream_queue,
+            playback_type=playback_type,
+            source_encoding=source_encoding,
+            source_sample_rate=source_rate,
+        )
+        if not stream_id:
+            raise RuntimeError("start_streaming_playback returned no stream_id")
+
+        logger.info(
+            "Pipeline tool continuation streaming started",
+            call_id=call_id,
+            stream_id=stream_id,
+            source_encoding=source_encoding,
+            source_sample_rate=source_rate,
+        )
+        try:
+            async for chunk in pipeline.tts_adapter.synthesize(
+                call_id, text, pipeline.tts_options
+            ):
+                if chunk:
+                    await self._put_pipeline_stream_chunk(
+                        call_id, stream_id, stream_queue, chunk
+                    )
+            await self._put_pipeline_stream_chunk(
+                call_id, stream_id, stream_queue, None
+            )
+            await self.streaming_playback_manager.stop_streaming_playback(
+                call_id, drain=True
+            )
+            logger.info(
+                "Pipeline tool continuation streaming completed",
+                call_id=call_id,
+                stream_id=stream_id,
+            )
+            return stream_id
+        except Exception:
+            try:
+                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+            except Exception:
+                logger.debug(
+                    "Pipeline tool continuation stop failed",
+                    call_id=call_id,
+                    stream_id=stream_id,
+                    exc_info=True,
+                )
+            raise
+
     @staticmethod
     def _is_pipeline_farewell_without_tool(
         user_text: str,
@@ -7944,17 +8119,17 @@ class Engine:
         if advertise_host in ("0.0.0.0", "::"):
             advertise_host = "127.0.0.1"
         port = self.config.audiosocket.port
-        # Match channel interface codec to YAML audiosocket.format
+        # Match the channel codec to this call's resolved profile. The global
+        # AudioSocket format remains the fallback for legacy sessions.
         codec = "slin"
         try:
-            fmt = (getattr(self.config.audiosocket, 'format', '') or '').lower()
-            if fmt in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
-                codec = "ulaw"
-            elif fmt in ("slin16", "linear16", "pcm16"):
-                codec = "slin16"
-            else:
-                # Treat any other/legacy value (e.g., 'slin') as 8 kHz PCM16
-                codec = "slin"
+            session = await self.session_store.get_by_call_id(caller_channel_id)
+            transport = getattr(session, "transport_profile", None) if session else None
+            fmt = getattr(transport, "wire_encoding", None)
+            rate = getattr(transport, "wire_sample_rate", None)
+            if not fmt:
+                fmt = getattr(self.config.audiosocket, 'format', '') or 'slin'
+            codec, _ = normalize_slin_format(fmt, rate)
         except Exception:
             codec = "slin"
         endpoint = f"AudioSocket/{advertise_host}:{port}/{audio_uuid}/c({codec})"
@@ -8168,7 +8343,16 @@ class Engine:
             if bool(td.get("enabled", False)):
                 return
             silence_ms = int(getattr(cfg, "pipeline_talk_detect_silence_ms", 1200))
-            talking_thr = int(getattr(cfg, "pipeline_talk_detect_talking_threshold", 128))
+            talking_thr = int(getattr(cfg, "pipeline_talk_detect_talking_threshold", 256))
+            threshold_source = "barge_in"
+            profile_threshold = getattr(
+                getattr(session, "transport_profile", None),
+                "talk_detect_talking_threshold",
+                None,
+            )
+            if profile_threshold is not None:
+                talking_thr = int(profile_threshold)
+                threshold_source = "audio_profile"
             value = f"{silence_ms},{talking_thr}"
             ok = await self.ari_client.set_channel_var(channel_id, "TALK_DETECT(set)", value)
             td.update(
@@ -8188,6 +8372,7 @@ class Engine:
                     channel_id=channel_id,
                     silence_ms=silence_ms,
                     talking_threshold=talking_thr,
+                    threshold_source=threshold_source,
                     is_pipeline=bool(self._pipeline_forced.get(call_id)),
                 )
             else:
@@ -8309,6 +8494,44 @@ class Engine:
                 return
 
             await self._no_input_note_activity(call_id, "asterisk:talk_detect_barge_in")
+
+            # The event may have entered this handler while playback was gated
+            # and then waited behind stream/session cleanup. Revalidate after
+            # the awaits above so a stale echo-tail event cannot barge into a
+            # stream that has already ended or pause listening immediately
+            # after gating reopens.
+            latest_session = await self.session_store.get_by_call_id(call_id)
+            if latest_session is not None:
+                session = latest_session
+            if bool(getattr(session, "audio_capture_enabled", True)) and not bool(
+                getattr(session, "tts_playing", False)
+            ):
+                latest_tts_ended_ts = float(
+                    getattr(session, "tts_ended_ts", 0.0) or 0.0
+                )
+                latest_elapsed_ms = (
+                    max(
+                        0,
+                        int(
+                            (time.time() - latest_tts_ended_ts) * 1000
+                        ),
+                    )
+                    if latest_tts_ended_ts > 0
+                    else post_guard_ms
+                )
+                if post_guard_ms > 0 and latest_elapsed_ms < post_guard_ms:
+                    logger.info(
+                        "Stale TalkDetect suppressed after playback ended",
+                        call_id=call_id,
+                        channel_id=channel_id,
+                        elapsed_ms=latest_elapsed_ms,
+                        protection_ms=post_guard_ms,
+                    )
+                else:
+                    await self._no_input_note_input_state(
+                        call_id, True, "asterisk:talk_detect"
+                    )
+                return
 
             # Treat talk detection as sufficient evidence of an active media path for platform flush.
             try:
@@ -9270,8 +9493,15 @@ class Engine:
             logger.error("Error binding AudioSocket UUID", conn_id=conn_id, uuid=uuid_str, error=str(exc), exc_info=True)
             return False
 
-    async def _audiosocket_handle_audio(self, conn_id: str, audio_bytes: bytes) -> None:
+    async def _audiosocket_handle_audio(
+        self,
+        conn_id: str,
+        frame: AudioSocketAudioFrame,
+    ) -> None:
         """Forward inbound AudioSocket audio to the active provider for the bound call."""
+        audio_bytes = frame.payload
+        frame_format = frame.encoding
+        frame_rate = frame.sample_rate
         # Track every frame for diagnostics
         if not hasattr(self, '_audiosocket_frame_count'):
             self._audiosocket_frame_count = {}
@@ -9304,6 +9534,9 @@ class Engine:
                     call_id=caller_channel_id,
                     frame_num=frame_num,
                     frame_bytes=len(audio_bytes),
+                    message_type=f"0x{frame.message_type:02x}",
+                    wire_format=frame_format,
+                    sample_rate=frame_rate,
                     conn_id=conn_id,
                 )
 
@@ -9325,8 +9558,12 @@ class Engine:
 
             diagnostics_flags = session.audio_diagnostics
             if "inbound_first_frame" not in diagnostics_flags:
-                fmt, rate = self._infer_transport_from_frame(len(audio_bytes))
-                await self._update_transport_profile(session, fmt=fmt, sample_rate=rate, source="audiosocket")
+                await self._update_transport_profile(
+                    session,
+                    fmt=frame_format,
+                    sample_rate=frame_rate,
+                    source="audiosocket-header",
+                )
                 diagnostics_flags["inbound_first_frame"] = True
 
             # Per-call RX bytes
@@ -9342,11 +9579,8 @@ class Engine:
                 vad_state = session.vad_state = {}
             if not vad_state.get('format_probe_done'):
                 try:
-                    try:
-                        as_fmt = (getattr(self.config, 'audiosocket', None).format or 'ulaw').lower()
-                    except Exception:
-                        as_fmt = 'ulaw'
-                    if as_fmt in ('slin16', 'linear16', 'pcm16'):
+                    as_fmt = frame_format
+                    if as_fmt.startswith('slin'):
                         rms_native = audioop.rms(audio_bytes, 2)
                         try:
                             swapped = audioop.byteswap(audio_bytes, 2)
@@ -9357,6 +9591,8 @@ class Engine:
                             "AudioSocket frame probe",
                             call_id=caller_channel_id,
                             audiosocket_format=as_fmt,
+                            sample_rate=frame_rate,
+                            message_type=f"0x{frame.message_type:02x}",
                             frame_bytes=len(audio_bytes),
                             rms_native=rms_native,
                             rms_swapped=rms_swapped,
@@ -9404,22 +9640,10 @@ class Engine:
             except Exception:
                 swap_needed_flag = False
             try:
-                # CRITICAL: AudioSocket format is authoritative for AudioSocket transport
-                # For RTP, use transport profile (negotiated codec)
                 if self.config.audio_transport == "audiosocket":
-                    # Use AudioSocket's actual format (from YAML)
-                    profile_fmt = getattr(self.config.audiosocket, "format", "slin16")
-                    # Get sample rate from AudioSocket config or infer from format
-                    profile_rate = getattr(self.config.audiosocket, "sample_rate", None)
-                    if not profile_rate:
-                        # Infer rate from format: slin=8kHz, slin16=16kHz
-                        canonical_fmt = self._canonicalize_encoding(profile_fmt)
-                        if canonical_fmt == "slin":
-                            profile_rate = 8000
-                        elif canonical_fmt == "slin16":
-                            profile_rate = 16000
-                        else:
-                            profile_rate = getattr(self.config.streaming, "sample_rate", 8000)
+                    # The TLV message type is the authoritative per-frame format.
+                    profile_fmt = frame_format
+                    profile_rate = frame_rate
                 else:
                     # For RTP: use transport profile (negotiated codec)
                     profile_fmt = session.transport_profile.format or "ulaw"
@@ -9427,8 +9651,8 @@ class Engine:
             except Exception:
                 # Safe fallback based on transport type
                 if self.config.audio_transport == "audiosocket":
-                    profile_fmt = "slin16"
-                    profile_rate = 16000
+                    profile_fmt = frame_format
+                    profile_rate = frame_rate
                 else:
                     profile_fmt = "ulaw"
                     profile_rate = 8000
@@ -9646,22 +9870,19 @@ class Engine:
                     return
                 if not getattr(session, "provider_session_active", False):
                     return
-                # CRITICAL FIX: Google Live needs gating, but OpenAI/Deepgram don't
-                # - Google Live: Bidirectional audio, NO server-side echo cancellation → NEEDS gating
-                # - OpenAI Realtime: Server-side AEC → gating harmful
-                # - Deepgram: Text-based output → no echo risk
+                # Google Live needs silence substitution during ordinary output.
+                # Other native full-agent providers keep caller audio flowing so
+                # their provider-owned VAD/barge-in remains functional.
                 needs_gating = self._get_provider_kind(provider_name) == "google_live"
                 
                 if needs_gating and not session.audio_capture_enabled:
-                    # CRITICAL: Google Live requires continuous audio stream (like WebRTC)
-                    # Send SILENCE frames instead of blocking to maintain stream continuity
-                    # This prevents echo while keeping VAD healthy
+                    # Send silence instead of blocking so Google Live's continuous
+                    # input timing and VAD state remain stable.
                     logger.debug(
                         "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
                         call_id=caller_channel_id,
                         audio_capture_enabled=session.audio_capture_enabled,
                     )
-                    # Replace audio with silence (zero-filled PCM16)
                     pcm_bytes = b'\x00' * len(pcm_bytes)
 
                 # Provider-agnostic upstream squelch: replace non-speech audio with silence so
@@ -9838,6 +10059,8 @@ class Engine:
                         pcm_rate_hz=pcm_rate,
                         audiosocket_wire=audio_bytes,
                         source="audiosocket",
+                        wire_encoding=frame_format,
+                        wire_sample_rate=frame_rate,
                     )
                 except Exception:
                     logger.debug("Provider barge-in fallback check failed (AudioSocket)", call_id=caller_channel_id, exc_info=True)
@@ -9881,7 +10104,12 @@ class Engine:
                 _vad_flag = bool(self.vad_manager) and self._should_use_local_vad(session.provider_name)
             if self.vad_manager and _vad_flag:
                 try:
-                    vad_result = await self._run_enhanced_vad(session, audio_bytes)
+                    vad_result = await self._run_enhanced_vad(
+                        session,
+                        audio_bytes,
+                        wire_encoding=frame_format,
+                        wire_sample_rate=frame_rate,
+                    )
                 except Exception:
                     logger.debug(
                         "Enhanced VAD processing error",
@@ -10362,29 +10590,46 @@ class Engine:
         except Exception as exc:
             logger.error("Error handling AudioSocket audio", conn_id=conn_id, error=str(exc), exc_info=True)
 
-    async def _run_enhanced_vad(self, session: CallSession, audio_bytes: bytes) -> Optional[VADResult]:
+    async def _run_enhanced_vad(
+        self,
+        session: CallSession,
+        audio_bytes: bytes,
+        *,
+        wire_encoding: Optional[str] = None,
+        wire_sample_rate: Optional[int] = None,
+    ) -> Optional[VADResult]:
         """Normalize inbound AudioSocket audio to PCM16 @ 8 kHz 20 ms frames and run enhanced VAD."""
         if not self.vad_manager or not audio_bytes:
             return None
 
         try:
-            # Detect AudioSocket wire format from session first (actual negotiated),
-            # then fall back to YAML. Map 'slin' (Asterisk) to PCM16 @ 8 kHz.
-            try:
-                fmt_token = (session.transport_profile.format or '').lower()
-            except Exception:
-                fmt_token = ''
+            # The AudioSocket TLV header is authoritative. Fall back to the
+            # resolved per-call profile, then YAML for legacy sessions.
+            fmt_token = str(wire_encoding or "").lower()
+            if not fmt_token:
+                try:
+                    fmt_token = str(
+                        getattr(session.transport_profile, "wire_encoding", "") or ""
+                    ).lower()
+                except Exception:
+                    fmt_token = ""
             if not fmt_token:
                 try:
                     fmt_token = (getattr(self.config, 'audiosocket', None).format or 'ulaw').lower()
                 except Exception:
                     fmt_token = 'ulaw'
 
-            # Determine source rate preference from session profile when available
             try:
-                prof_rate = int(session.transport_profile.sample_rate or 0)
+                prof_rate = int(wire_sample_rate or 0)
             except Exception:
                 prof_rate = 0
+            if prof_rate <= 0:
+                try:
+                    prof_rate = int(
+                        getattr(session.transport_profile, "wire_sample_rate", 0) or 0
+                    )
+                except Exception:
+                    prof_rate = 0
 
             if fmt_token in ('ulaw', 'mulaw', 'g711_ulaw', 'mu-law'):
                 pcm_src = EnhancedVADManager.mu_law_to_pcm16(audio_bytes)
@@ -10565,6 +10810,8 @@ class Engine:
         pcm_rate_hz: int,
         audiosocket_wire: Optional[bytes],
         source: str,
+        wire_encoding: Optional[str] = None,
+        wire_sample_rate: Optional[int] = None,
     ) -> None:
         """Local VAD fallback for provider-owned mode (flush-only, no provider cancellation)."""
         try:
@@ -10666,7 +10913,12 @@ class Engine:
             if self.vad_manager:
                 try:
                     if source == "audiosocket":
-                        vad_result = await self._run_enhanced_vad(session, audiosocket_wire or b"")
+                        vad_result = await self._run_enhanced_vad(
+                            session,
+                            audiosocket_wire or b"",
+                            wire_encoding=wire_encoding,
+                            wire_sample_rate=wire_sample_rate,
+                        )
                     else:
                         vad_result = await self._run_enhanced_vad_pcm16(session, pcm16, int(pcm_rate_hz or 0) or 16000)
                 except Exception:
@@ -12101,6 +12353,13 @@ class Engine:
 
             # Provider requests early TTS gating clear (e.g., OpenAI greeting complete)
             if etype == "ClearTtsGating":
+                if bool(event.get("defer_until_drain", False)):
+                    logger.info(
+                        "Deferring provider-requested TTS gating clear until transport drain",
+                        call_id=call_id,
+                        reason=event.get("reason"),
+                    )
+                    return
                 try:
                     tokens = list(getattr(session, "tts_tokens", set()) or [])
                 except Exception:
@@ -12716,6 +12975,9 @@ class Engine:
                 # Provider generation has ended. The downstream transport may
                 # still hold seconds of audio, so lifecycle completion and drain
                 # completion remain separate signals.
+                defer_gating_until_drain = bool(
+                    event.get("defer_tts_gating_until_drain", False)
+                )
                 # If we were suppressing output due to barge-in, end suppression at a segment boundary.
                 # This prevents cutting into the next (new) response once the provider finishes the interrupted one.
                 try:
@@ -12741,30 +13003,38 @@ class Engine:
                         await self.streaming_playback_manager.mark_segment_boundary(call_id)
                     except Exception:
                         logger.debug("Failed to mark segment boundary", call_id=call_id, exc_info=True)
-                    try:
-                        await self.streaming_playback_manager.end_segment_gating(
-                            call_id,
-                            notify_no_input=False,
+                    if defer_gating_until_drain:
+                        logger.info(
+                            "Retaining greeting TTS gating until transport drain",
+                            call_id=call_id,
+                            provider=getattr(session, "provider_name", None),
                         )
-                    except Exception:
-                        logger.debug("Failed to end segment gating", call_id=call_id, exc_info=True)
-                    # Also clear fallback gating token if direct gating was applied
-                    try:
-                        _fallback_token = f"tts_segment:{call_id}"
-                        if self.conversation_coordinator:
-                            await self.conversation_coordinator.on_tts_end(
+                    else:
+                        try:
+                            await self.streaming_playback_manager.end_segment_gating(
                                 call_id,
-                                _fallback_token,
-                                reason="segment-end-fallback",
                                 notify_no_input=False,
                             )
-                        else:
-                            await self.session_store.clear_gating_token(call_id, _fallback_token)
-                    except Exception:
-                        pass
-                    # CRITICAL FIX #1: Do NOT discard call_id for providers with server-side AEC
-                    # (OpenAI, Deepgram, etc.) — discarding causes repeated re-gating interruptions.
-                    # Re-arm only for providers/backends that need self-echo suppression.
+                        except Exception:
+                            logger.debug("Failed to end segment gating", call_id=call_id, exc_info=True)
+                        # Also clear fallback gating token if direct gating was applied
+                        try:
+                            _fallback_token = f"tts_segment:{call_id}"
+                            if self.conversation_coordinator:
+                                await self.conversation_coordinator.on_tts_end(
+                                    call_id,
+                                    _fallback_token,
+                                    reason="segment-end-fallback",
+                                    notify_no_input=False,
+                                )
+                            else:
+                                await self.session_store.clear_gating_token(call_id, _fallback_token)
+                        except Exception:
+                            pass
+                    # Keep provider-native VAD/barge-in paths continuously armed
+                    # after their one-time greeting gate. Re-gating every response
+                    # would suppress caller interruption audio. Providers without
+                    # that path must re-arm engine-side echo suppression.
                     _prov = getattr(session, 'provider_name', None)
                     should_rearm_segment_gating = self._get_provider_kind(_prov) in ("google_live", "local")
                     if should_rearm_segment_gating:
@@ -12793,7 +13063,11 @@ class Engine:
                 # Publish generation completion only after the stream boundary
                 # or sentinel is in place. The lifecycle observer then keeps raw
                 # VAD/watchdog output state active until those buffers drain.
-                await self._note_provider_output_end(call_id, session)
+                await self._note_provider_output_end(
+                    call_id,
+                    session,
+                    clear_tts_gating_after_drain=defer_gating_until_drain,
+                )
 
                 # Signal farewell done event if we're waiting for hangup
                 farewell_key = f"farewell_done_{call_id}"
@@ -15385,6 +15659,8 @@ class Engine:
                                             "tool", tool_result_msg,
                                             tool_call_id=f"call_{name}"
                                         ))
+                                        session.conversation_history = list(conversation_history)
+                                        await self.session_store.upsert_call(session)
                                         logger.info("Tool result added to conversation, triggering LLM continuation", tool=name, call_id=call_id)
                                         
                                         # Trigger LLM to generate follow-up response
@@ -15402,22 +15678,55 @@ class Engine:
                                                     response_text = llm_response.text.strip()
                                                     if response_text:
                                                         conversation_history.append(_ts_msg("assistant", response_text))
+                                                        session.conversation_history = list(conversation_history)
+                                                        await self.session_store.upsert_call(session)
                                                         logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
-                                                        
-                                                        # Synthesize and play TTS
-                                                        tts_bytes = bytearray()
-                                                        async for chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
-                                                            if chunk:
-                                                                tts_bytes.extend(chunk)
-                                                        if tts_bytes:
-                                                            pid = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
-                                                            duration_sec = len(tts_bytes) / 8000.0
-                                                            if pid:
-                                                                await self.playback_manager.wait_for_playback_end(
+
+                                                        if not self._pipeline_output_allowed(
+                                                            call_id,
+                                                            session,
+                                                            stage="tool-continuation-tts",
+                                                        ):
+                                                            return
+
+                                                        if self._pipeline_tts_uses_streaming(pipeline):
+                                                            try:
+                                                                await self._stream_pipeline_tts_text(
                                                                     call_id,
-                                                                    pid,
-                                                                    timeout_sec=(duration_sec + 3.0),
+                                                                    session,
+                                                                    pipeline,
+                                                                    response_text,
                                                                 )
+                                                            except _PipelinePlaybackInterrupted:
+                                                                logger.info(
+                                                                    "Pipeline tool continuation interrupted",
+                                                                    call_id=call_id,
+                                                                )
+                                                                return
+                                                        else:
+                                                            # File-mode adapters are required to emit
+                                                            # the file player's μ-law/8 kHz contract.
+                                                            tts_bytes = bytearray()
+                                                            async for chunk in pipeline.tts_adapter.synthesize(
+                                                                call_id,
+                                                                response_text,
+                                                                pipeline.tts_options,
+                                                            ):
+                                                                if chunk:
+                                                                    tts_bytes.extend(chunk)
+                                                            if tts_bytes:
+                                                                pid = await self.playback_manager.play_audio(
+                                                                    call_id,
+                                                                    bytes(tts_bytes),
+                                                                    "pipeline-tts",
+                                                                )
+                                                                duration_sec = len(tts_bytes) / 8000.0
+                                                                if pid:
+                                                                    await self.playback_manager.wait_for_playback_end(
+                                                                        call_id,
+                                                                        pid,
+                                                                        timeout_sec=(duration_sec + 3.0),
+                                                                    )
                                                 
                                                 # Handle tool calls (with or without text)
                                                 if getattr(llm_response, 'tool_calls', None):
@@ -15803,7 +16112,13 @@ class Engine:
     def _normalize_audio_format(raw_format: Optional[str]) -> Tuple[str, int, str]:
         """Map assorted codec tokens to canonical AudioSocket format + sample rate."""
         reported = (raw_format or "").strip()
-        token = reported.lower()
+        token = reported.lower().strip()
+        # Asterisk may render a single native format as ``(g722)`` (and
+        # similarly wrap other codec names).  Normalize that presentation
+        # before applying aliases so observability and any detected-profile
+        # fallback retain the actual caller codec.
+        while len(token) >= 2 and token[0] == "(" and token[-1] == ")":
+            token = token[1:-1].strip()
 
         alias_map = {
             "mulaw": "ulaw",
@@ -16088,23 +16403,41 @@ class Engine:
         context_pipeline = str(
             getattr(no_input_context, "pipeline", None) or ""
         ).strip()
-        pipeline_profile_only = bool(
-            context_pipeline
-            and not str(getattr(no_input_context, "provider", None) or "").strip()
-            and not channel_vars.get("AI_PROVIDER")
+        configured_pipelines = getattr(self.config, "pipelines", {}) or {}
+        explicit_channel_provider = str(
+            channel_vars.get("AI_PROVIDER") or ""
+        ).strip()
+        channel_pipeline = (
+            explicit_channel_provider
+            if explicit_channel_provider in configured_pipelines
+            else ""
         )
-        # A manually configured pipeline Agent has no monolithic provider by
-        # design. Do not let CallSession's compatibility default accidentally
-        # select one; use the pipeline identity and profile preferences directly.
+        effective_pipeline = channel_pipeline or context_pipeline
+        pipeline_profile_only = bool(
+            effective_pipeline
+            and (
+                channel_pipeline
+                or (
+                    not explicit_channel_provider
+                    and not str(
+                        getattr(no_input_context, "provider", None) or ""
+                    ).strip()
+                )
+            )
+        )
+        # Pipeline-only Agents and an explicit AI_PROVIDER=<pipeline> dialplan
+        # selection have no monolithic provider by design. Do not let
+        # CallSession's compatibility default accidentally select one; use the
+        # pipeline identity and the Agent/profile preferences directly.
         if pipeline_profile_only:
-            provider_name = context_pipeline
+            provider_name = effective_pipeline
             provider = None
         else:
             provider = (
                 getattr(self, "_call_providers", {}).get(session.call_id)
                 or self.providers.get(provider_name)
             )
-        if not provider and not context_pipeline:
+        if not provider and not effective_pipeline:
             logger.warning(
                 "Provider not found for audio profile resolution",
                 call_id=session.call_id,
@@ -16121,7 +16454,7 @@ class Engine:
             logger.info(
                 "Resolving pipeline Agent audio profile without monolithic provider",
                 call_id=session.call_id,
-                pipeline=context_pipeline,
+                pipeline=effective_pipeline,
                 profile=getattr(no_input_context, "profile", None),
                 context_name=session.context_name,
             )
@@ -16155,6 +16488,30 @@ class Engine:
                 # same agent for audio-profile lookup as for prompt/tools (Finding 1).
                 routing_method=session.routing_method,
             )
+
+            if (
+                getattr(self.config, "audio_transport", "audiosocket") == "audiosocket"
+                and int(transport.wire_sample_rate or 0) > 8000
+            ):
+                asterisk_version = getattr(self.ari_client, "asterisk_version", None)
+                if not supports_multirate_audiosocket(asterisk_version):
+                    message = (
+                        "audio_profile_incompatible: AudioSocket wideband requires "
+                        "Asterisk 20.17+, 21.12+, 22.7+, or 23.1+; "
+                        f"detected {asterisk_version or 'an unknown version'}"
+                    )
+                    session.context_resolution_error = message
+                    session.error_message = message
+                    await self._save_session(session)
+                    logger.error(
+                        "Wideband AudioSocket profile rejected on incompatible Asterisk",
+                        call_id=session.call_id,
+                        profile=transport.profile_name,
+                        wire_format=f"{transport.wire_encoding}@{transport.wire_sample_rate}Hz",
+                        asterisk_version=asterisk_version,
+                        remediation="Upgrade Asterisk or select an 8 kHz audio profile",
+                    )
+                    return
             
             # Store transport in session (keep as object, not dict, for legacy code compatibility)
             session.transport_profile = transport
@@ -16164,29 +16521,15 @@ class Engine:
             
             await self._save_session(session)
             
-            # Apply to streaming manager
-            # CRITICAL: Do NOT set global sample_rate - it's shared across all calls!
-            # Each call must pass target_sample_rate explicitly to start_streaming_playback()
-            try:
-                self.streaming_playback_manager.audiosocket_format = transport.wire_encoding
-                # REMOVED: self.streaming_playback_manager.sample_rate = transport.wire_sample_rate
-                # Global sample_rate causes race condition when multiple calls use different rates
-                if hasattr(self.streaming_playback_manager, 'chunk_size_ms'):
-                    self.streaming_playback_manager.chunk_size_ms = transport.chunk_ms
-                if hasattr(self.streaming_playback_manager, 'idle_cutoff_ms'):
-                    self.streaming_playback_manager.idle_cutoff_ms = transport.idle_cutoff_ms
-            except Exception as exc:
-                logger.warning(
-                    "Failed to apply transport to streaming manager",
-                    call_id=session.call_id,
-                    error=str(exc),
-                )
-            
             # Store per-call provider overrides (do NOT mutate global provider templates).
             try:
                 session.provider_overrides = dict(getattr(session, "provider_overrides", {}) or {})
                 session.provider_overrides["target_encoding"] = transport.wire_encoding
                 session.provider_overrides["target_sample_rate_hz"] = transport.wire_sample_rate
+                session.provider_overrides["provider_input_encoding"] = transport.provider_input_encoding
+                session.provider_overrides["provider_input_sample_rate_hz"] = transport.provider_input_sample_rate
+                session.provider_overrides["provider_output_encoding"] = transport.provider_output_encoding
+                session.provider_overrides["provider_output_sample_rate_hz"] = transport.provider_output_sample_rate
                 await self._save_session(session)
             except Exception:
                 logger.debug(
@@ -17281,6 +17624,26 @@ class Engine:
                 except Exception:
                     transport_rate = None
 
+            try:
+                profile_chunk_ms = getattr(session.transport_profile, "chunk_ms", None)
+                if profile_chunk_ms is not None:
+                    chunk_ms = int(profile_chunk_ms)
+            except Exception:
+                pass
+            try:
+                profile_idle_cutoff_ms = getattr(session.transport_profile, "idle_cutoff_ms", None)
+                if profile_idle_cutoff_ms is not None:
+                    idle_cutoff_ms = int(profile_idle_cutoff_ms)
+            except Exception:
+                pass
+
+        # A resolved call profile is authoritative over the manager's process-
+        # wide fallback. Report the wire format the call actually requested.
+        if transport_fmt:
+            wire_encoding = transport_fmt
+        if transport_rate:
+            wire_rate = transport_rate
+
         def _canon_rate(value: Optional[Any]) -> Optional[int]:
             if value is None:
                 return None
@@ -17444,6 +17807,46 @@ class Engine:
         )
         resolution.tts_options["output_resampler"] = mode
         resolution.tts_options["output_resampler_source"] = source
+
+        wire_encoding = str(getattr(transport, "wire_encoding", "") or "").lower()
+        wire_rate = int(getattr(transport, "wire_sample_rate", 0) or 0)
+        wideband_format = getattr(adapter, "wideband_output_format", None)
+        wideband_applied = False
+        if wire_encoding in {"linear16", "pcm16", "slin16"} and wire_rate >= 16000:
+            if wideband_format:
+                target_encoding = str(wideband_format.get("encoding") or "linear16")
+                target_rate = int(wideband_format.get("sample_rate") or wire_rate)
+                # Adapters use one of these three option shapes. Supplying all
+                # of them is harmless and keeps the capability declaration
+                # independent of an adapter's legacy configuration schema.
+                resolution.tts_options["format"] = {
+                    "encoding": target_encoding,
+                    "sample_rate": target_rate,
+                }
+                resolution.tts_options["target_format"] = {
+                    "encoding": target_encoding,
+                    "sample_rate": target_rate,
+                }
+                resolution.tts_options["target_encoding"] = target_encoding
+                resolution.tts_options["target_sample_rate_hz"] = target_rate
+                for option_name, option_value in dict(
+                    wideband_format.get("options") or {}
+                ).items():
+                    resolution.tts_options[option_name] = (
+                        dict(option_value)
+                        if isinstance(option_value, dict)
+                        else option_value
+                    )
+                wideband_applied = True
+            else:
+                logger.warning(
+                    "Pipeline TTS has no native wideband output declaration; legacy output will be converted at the transport boundary",
+                    call_id=session.call_id,
+                    pipeline=resolution.pipeline_name,
+                    adapter=type(adapter).__name__,
+                    wire_sample_rate=wire_rate,
+                )
+        resolution.tts_options["_wideband_output_applied"] = wideband_applied
         resolution.tts_options["_output_resampler_resolved"] = True
         logger.info(
             "Pipeline output resampler policy resolved",
@@ -17452,6 +17855,7 @@ class Engine:
             profile=getattr(transport, "profile_name", None),
             mode=mode,
             source=source,
+            wideband_output_applied=wideband_applied,
         )
 
     async def _assign_pipeline_to_session(
@@ -17637,7 +18041,7 @@ class Engine:
         bg_task.add_done_callback(_done)
 
     def _apply_provider_overrides(self, provider: AIProviderInterface, session: CallSession) -> None:
-        """Apply per-call overrides (greeting/prompt/target format) to a provider instance."""
+        """Apply per-call prompt and negotiated audio formats to a provider instance."""
         overrides = {}
         try:
             overrides = dict(getattr(session, "provider_overrides", {}) or {})
@@ -17661,6 +18065,13 @@ class Engine:
         prompt = overrides.get("prompt")
         target_encoding = overrides.get("target_encoding")
         target_rate = overrides.get("target_sample_rate_hz")
+        provider_input_encoding = overrides.get("provider_input_encoding")
+        provider_input_rate = overrides.get("provider_input_sample_rate_hz")
+        provider_output_encoding = overrides.get("provider_output_encoding")
+        provider_output_rate = overrides.get("provider_output_sample_rate_hz")
+        transport = getattr(session, "transport_profile", None)
+        wire_encoding = getattr(transport, "wire_encoding", None) if transport else None
+        wire_rate = getattr(transport, "wire_sample_rate", None) if transport else None
 
         try:
             if isinstance(cfg, dict):
@@ -17674,6 +18085,27 @@ class Engine:
                     cfg["target_encoding"] = target_encoding
                 if target_rate:
                     cfg["target_sample_rate_hz"] = target_rate
+                # Dict-backed full-agent configs (currently uncommon) use
+                # provider_input_* when available; Deepgram's legacy contract
+                # declares the provider boundary directly as input_*.
+                if "provider_input_encoding" in cfg:
+                    if provider_input_encoding:
+                        cfg["provider_input_encoding"] = provider_input_encoding
+                    if provider_input_rate:
+                        cfg["provider_input_sample_rate_hz"] = provider_input_rate
+                    if wire_encoding:
+                        cfg["input_encoding"] = wire_encoding
+                    if wire_rate:
+                        cfg["input_sample_rate_hz"] = wire_rate
+                else:
+                    if provider_input_encoding:
+                        cfg["input_encoding"] = provider_input_encoding
+                    if provider_input_rate:
+                        cfg["input_sample_rate_hz"] = provider_input_rate
+                if provider_output_encoding:
+                    cfg["output_encoding"] = provider_output_encoding
+                if provider_output_rate:
+                    cfg["output_sample_rate_hz"] = provider_output_rate
             else:
                 if greeting and hasattr(cfg, "greeting"):
                     setattr(cfg, "greeting", greeting)
@@ -17686,6 +18118,26 @@ class Engine:
                     setattr(cfg, "target_encoding", target_encoding)
                 if target_rate and hasattr(cfg, "target_sample_rate_hz"):
                     setattr(cfg, "target_sample_rate_hz", target_rate)
+                if hasattr(cfg, "provider_input_encoding"):
+                    if provider_input_encoding:
+                        setattr(cfg, "provider_input_encoding", provider_input_encoding)
+                    if provider_input_rate and hasattr(cfg, "provider_input_sample_rate_hz"):
+                        setattr(cfg, "provider_input_sample_rate_hz", provider_input_rate)
+                    if wire_encoding and hasattr(cfg, "input_encoding"):
+                        setattr(cfg, "input_encoding", wire_encoding)
+                    if wire_rate and hasattr(cfg, "input_sample_rate_hz"):
+                        setattr(cfg, "input_sample_rate_hz", wire_rate)
+                else:
+                    # Deepgram Voice Agent exposes its provider boundary as
+                    # input_* rather than provider_input_*.
+                    if provider_input_encoding and hasattr(cfg, "input_encoding"):
+                        setattr(cfg, "input_encoding", provider_input_encoding)
+                    if provider_input_rate and hasattr(cfg, "input_sample_rate_hz"):
+                        setattr(cfg, "input_sample_rate_hz", provider_input_rate)
+                if provider_output_encoding and hasattr(cfg, "output_encoding"):
+                    setattr(cfg, "output_encoding", provider_output_encoding)
+                if provider_output_rate and hasattr(cfg, "output_sample_rate_hz"):
+                    setattr(cfg, "output_sample_rate_hz", provider_output_rate)
         except Exception:
             logger.debug("Failed applying provider overrides", call_id=session.call_id, exc_info=True)
 
@@ -17798,6 +18250,27 @@ class Engine:
                 alias_safe=(mode == "bandlimited" and source_rate > target_rate),
             )
         return converted, target_rate
+
+    def _provider_input_mode_for_transport(self, session: CallSession) -> str:
+        """Resolve the provider input mode without losing legacy AudioSocket config."""
+        if self.config.audio_transport == "externalmedia":
+            return "pcm16_16k"
+
+        transport = getattr(session, "transport_profile", None)
+        wire_format = str(getattr(transport, "wire_encoding", "") or "").lower()
+        wire_rate = int(getattr(transport, "wire_sample_rate", 0) or 0)
+        if not wire_format:
+            wire_format = str(
+                getattr(getattr(self.config, "audiosocket", None), "format", "") or ""
+            ).lower()
+        if not wire_rate and wire_format in {"slin16", "linear16", "pcm16"}:
+            wire_rate = 16000
+
+        if wire_format in {"ulaw", "mulaw", "g711_ulaw"}:
+            return "mulaw8k"
+        if wire_format in {"slin16", "linear16", "pcm16"} and wire_rate >= 16000:
+            return "pcm16_16k"
+        return "pcm16_8k"
 
     async def _start_provider_session(self, call_id: str) -> None:
         """Start the provider session for a call when media path is ready."""
@@ -17953,24 +18426,9 @@ class Engine:
             # Set provider input mode based on transport so send_audio can convert properly
             try:
                 if hasattr(provider, 'set_input_mode'):
-                    if self.config.audio_transport == 'externalmedia':
-                        provider.set_input_mode('pcm16_16k')
-                    else:
-                        # Determine input mode from AudioSocket format
-                        as_fmt = None
-                        try:
-                            if self.config.audiosocket and hasattr(self.config.audiosocket, 'format'):
-                                as_fmt = (self.config.audiosocket.format or '').lower()
-                        except Exception:
-                            as_fmt = None
-                        if as_fmt in ('ulaw', 'mulaw', 'g711_ulaw'):
-                            provider.set_input_mode('mulaw8k')
-                        elif as_fmt in ('slin16', 'linear16', 'pcm16'):
-                            # slin16 is 16kHz PCM16, set correct input mode
-                            provider.set_input_mode('pcm16_16k')
-                        else:
-                            # Default to PCM16 at 8 kHz for slin (8kHz) or unspecified
-                            provider.set_input_mode('pcm16_8k')
+                    provider.set_input_mode(
+                        self._provider_input_mode_for_transport(session)
+                    )
             except Exception:
                 logger.debug("Provider set_input_mode failed or unsupported", exc_info=True)
 

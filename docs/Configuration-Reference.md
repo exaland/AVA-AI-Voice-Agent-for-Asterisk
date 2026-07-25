@@ -126,6 +126,40 @@ contract plus alias-safe provider-output downsampling. It reduces sibilant hiss
 when a provider emits 16 or 24 kHz PCM; native 8 kHz output is unchanged. To
 roll back a test, assign the Agent back to `telephony_ulaw_8k`.
 
+`wideband_pcm_16k` is the opt-in end-to-end wideband profile for AudioSocket.
+It originates the media channel as `c(slin16)`, receives PCM16 at 16 kHz in
+AudioSocket type `0x12`, and stamps outbound frames with the same type. This is
+per call, so 8 and 16 kHz Agents can run concurrently. Full-agent providers use
+their declared native PCM boundary (16 or 24 kHz), and supported modular TTS
+adapters request PCM and convert once to the 16 kHz AudioSocket boundary. It
+requires Asterisk 20.17+, 21.12+, 22.7+, or 23.1+ and a wideband caller leg
+(for example G.722). Older or unrecognized Asterisk versions fail the call
+closed with a remediation message. Use
+`telephony_ulaw_8k` or `telephony_enhanced_8k` for PSTN/G.711 calls;
+upsampling an 8 kHz trunk cannot restore frequencies that the trunk discarded.
+
+ExternalMedia RTP supports the shipped `telephony_ulaw_8k` and
+`telephony_enhanced_8k` profiles only. Do not assign `wideband_pcm_16k` while
+`audio_transport: externalmedia` is active. RTP ExternalMedia has no SDP offer
+and therefore cannot negotiate the dynamic payload mapping used by Asterisk for
+`slin16`; returning payload type 118 produced no caller audio in live testing.
+Asterisk Media over WebSocket can carry `slin16`, but AAVA does not currently
+implement that separate transport. Use AudioSocket for supported wideband audio.
+
+The wideband provider boundary is call-scoped and does not rewrite provider
+defaults. OpenAI Realtime uses PCM at 24 kHz in both directions; Google Live
+uses 16 kHz input and fixed 24 kHz output; ElevenLabs, Deepgram, and Grok use
+their declared 16 kHz PCM route. Their output is converted to the 16 kHz wire
+rate where necessary. Local TTS negotiates native `linear16@16000` output for
+Piper and Kokoro (local or API mode); MeloTTS, Matcha, and Silero retain a
+truthful μ-law/8 kHz fallback. The Local Hybrid Piper path is live-validated;
+the local Kokoro CPU canary preserved correct 16 kHz media but failed the
+interactive-latency gate because whole-utterance synthesis was approximately
+real-time or slower. Kokoro API mode and the local full-agent path remain
+untested. Use Piper for CPU deployments unless local Kokoro performance has
+been measured on the target host. Switching the Agent back to an 8 kHz profile
+is an immediate per-call rollback.
+
 The profile field is `output_resampler: linear | bandlimited`. Provider and
 pipeline fields default to `inherit`. Narrow overrides resolve in this order:
 full-agent environment override, pipeline override, provider override, audio
@@ -295,7 +329,7 @@ contains configuration and verification evidence, but never the referenced API p
 - audiosocket.host: Bind address for AudioSocket listener.
 - audiosocket.advertise_host: Address Asterisk connects to (optional; defaults to `audiosocket.host`). Use for NAT/VPN.
 - audiosocket.port: TCP port.
-- audiosocket.format: shipped YAML uses `slin` (16-bit signed linear @ 8 kHz) — this is what runs in production and is the validated default. The Pydantic code default is `slin16` if you remove the YAML override; `slin16`, `slin24`, `ulaw`, and `alaw` are also accepted by the validator but are not currently exercised in CI or the dev server. Stick with `slin` unless you have a specific reason.
+- audiosocket.format: fallback wire format for legacy/companded profiles. Shipped YAML uses `slin` (16-bit signed linear @ 8 kHz), the validated compatibility default. Signed-linear Audio Profiles override this per call: `wideband_pcm_16k` selects `slin16` without changing the global value. Keep the fallback at `slin`; select wideband on the Agent or with `AI_AUDIO_PROFILE` rather than changing it globally.
 
 ## ExternalMedia
 
@@ -303,7 +337,7 @@ contains configuration and verification evidence, but never the referenced API p
 - external_media.advertise_host: Address Asterisk sends RTP to (optional; defaults to `external_media.rtp_host`). Use for NAT/VPN.
 - external_media.rtp_port: Port for inbound RTP.
 - external_media.port_range: Optional range (`start:end`) for dynamic per-call RTP allocation; defaults to `rtp_port`.
-- external_media.codec: `ulaw` | `slin16` (8 kHz).
+- external_media.codec: Asterisk RTP wire codec. The supported release baseline is `ulaw` at 8 kHz with `telephony_ulaw_8k` or `telephony_enhanced_8k`. `slin16`/16 kHz RTP is not supported; use AudioSocket with `wideband_pcm_16k` instead.
 - external_media.direction: `both` | `sendonly` | `recvonly`.
 - external_media.lock_remote_endpoint: When true (default), **do not** accept mid-call changes to the inbound RTP source `(ip,port)` for that call.
 - external_media.allowed_remote_hosts: Optional list of **IP addresses** allowed as inbound RTP sources. When set, packets from other sources are dropped (recommended when the RTP source IP is stable).
@@ -325,7 +359,7 @@ Controls interruption of TTS playback when the caller speaks.
 - barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold (more sensitive than full-agent mode).
 - barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.
 - barge_in.pipeline_talk_detect_silence_ms: 800–2000. Pipeline-only; `TALK_DETECT(set)` silence window.
-- barge_in.pipeline_talk_detect_talking_threshold: 64–256. Pipeline-only; `TALK_DETECT(set)` talking threshold.
+- barge_in.pipeline_talk_detect_talking_threshold: 1–32768 (default 256). Pipeline-only; global Asterisk `TALK_DETECT(set)` DSP magnitude threshold. Audio profiles can override it with `profiles.<name>.talk_detect_talking_threshold`; `wideband_pcm_16k` uses the live-validated value 1000 to reject wideband playback echo while retaining caller barge-in.
 
 Notes (pipelines / `local_hybrid`):
 

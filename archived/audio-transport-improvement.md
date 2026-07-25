@@ -4,6 +4,102 @@ Validate audio quality and transport integrity across the maintainer-approved re
 
 ## Progress
 
+- **G.722-capable public demo trunk available; final validation pending
+  (2026-07-24):** the public demo number is now `(909) 788-2282` on a SIP trunk
+  that supports G.722. README wording advertises HD Voice only when the caller's
+  carrier/device and the complete negotiated path preserve wideband audio, with
+  standard telephony fallback otherwise. Before final PR freeze, place a call
+  through the public number and capture the Asterisk channel codec plus one
+  representative `wideband_pcm_16k` provider call ID. Trunk capability alone
+  does not prove that an individual PSTN or mobile call negotiated G.722.
+
+- **ExternalMedia RTP wideband experiment rejected; prototype removed
+  (2026-07-24):** Google call `1784951517.124`, archived at
+  `logs/archived/rca-20260725-035425`, selected `wideband_pcm_16k` while the
+  ExternalMedia channel remained `ulaw@8000`. Google produced the greeting, but
+  provider PCM was emitted as payload-type-0 μ-law and reached the caller as
+  noise. A follow-up prototype originated `slin16`, returned payload type 118,
+  and proved with packet captures and Asterisk RTP debug that the engine sent
+  valid 16 kHz frames. Calls `1784952572.145`, `1784952964.152`, and
+  `1784953234.159` nevertheless produced silence because RTP ExternalMedia has
+  no SDP negotiation for the dynamic `slin16` payload mapping; Asterisk received
+  the packets but did not translate them into the G.722 caller leg. This matches
+  the [Asterisk maintainer guidance](https://community.asterisk.org/t/ari-external-media-code-issue/110111/4)
+  that dynamic payload types are unsupported for RTP ExternalMedia. All
+  experimental RTP code and tests were removed, so
+  ExternalMedia remains on its prior supported `ulaw`/8 kHz baseline with
+  `telephony_ulaw_8k` or `telephony_enhanced_8k`. Supported 16 kHz remains an
+  AudioSocket-only opt-in. Asterisk Media over WebSocket is a possible future
+  transport, not part of this branch; see the
+  [official Asterisk Media WebSocket documentation](https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/).
+  The post-removal gate passed 77 focused backend transport tests and all 222
+  Admin UI tests, plus the frontend production build and lint budget.
+
+- **Local AI Server native-wideband slice validated (2026-07-24):** branch
+  `codex/audiosocket-multirate` now carries an opt-in, per-call TTS output
+  contract for Local AI Server protocol v2. Legacy clients and 8 kHz profiles
+  continue to receive Piper μ-law/8 kHz. A wideband profile requests
+  `linear16@16000`; Piper is synthesized once at its native 22.05 kHz and
+  resampled directly to 16 kHz without the former intermediate μ-law/8 kHz
+  companding step. Format/rate are included in phrase-cache keys, response
+  metadata, echo-suppression duration, greetings, normal turns, tool-result
+  turns, terminal farewells, and streaming chunks. Local Hybrid declares the
+  native-wideband contract to the pipeline resolver and retains a defensive
+  conversion fallback when an older server returns legacy audio. The focused
+  regression gate passes 120 tests (2 warnings), including legacy defaults,
+  per-session negotiation, Piper native output, cancellation, terminal
+  farewell, provider timing, and pipeline output policy. The broader
+  container gate passes 1,946 tests with 18 expected skips after excluding two
+  harness-only suites whose stripped PATH lacks host `git`/`python3`; the Local
+  AI Server and AI Engine production images both build successfully.
+- **Local Hybrid 8 kHz before-call (2026-07-24):** call
+  `1784944618.100`, archived at
+  `logs/archived/rca-20260725-015750`, is the comparison control. It used
+  `local_stt → openai_llm → local_tts`, `telephony_ulaw_8k`, Piper
+  μ-law/8 kHz, and `slin@8000` AudioSocket. The 42-second call completed via
+  agent hangup with media RX confirmed. The completed post-change comparison
+  reused extension 3000 and the same representative conversation after the
+  rebuilt Local AI Server and AI Engine were deployed.
+- **Local Hybrid native-wideband after-call (2026-07-24):** call
+  `1784946127.104`, archived at `logs/archived/rca-20260725-022309`, validates
+  the opt-in Local TTS contract on deployed revision `bd3e8216`. The call used
+  G.722 from extension 6000, AudioSocket type `0x12` / `slin16@16000`, Local STT
+  PCM16/16 kHz, and Piper `linear16@16000`. Greeting, ordinary replies, and the
+  terminal farewell all opened as `slin16@16000 -> slin16@16000`, with no
+  legacy mu-law stage and no output resampling. The maintainer reported that
+  the conversation after the greeting worked fine. The greeting itself was
+  interrupted after 4.98 caller-facing seconds by the real utterance `Hello,
+  can you hear me?`; the 8 kHz control shows the same five-second
+  greeting-protection/barge-in pattern, so this is not a wideband regression.
+  The farewell drained, the 46-second call ended cleanly, and post-call health
+  had no active resources. The Local Hybrid wideband row is **PASS**; shortening
+  the demo greeting or changing greeting interruption policy is optional UX
+  follow-up outside this transport slice.
+- **Kokoro-only Local TTS expansion (2026-07-24):** the maintainer limited the
+  remaining Local AI Server scope to Kokoro to avoid repeated long image
+  rebuilds. Kokoro local and API mode now converge on raw PCM plus the actual
+  native sample rate and perform one conversion to negotiated
+  `linear16@16000`. Legacy clients still receive μ-law/8 kHz; MeloTTS, Matcha,
+  and Silero reject the wideband request to the existing truthful 8 kHz
+  fallback. The focused Local TTS/pipeline contract suite passes 124 tests with
+  two warnings. The broad backend gate passes 1,959 tests with 18 expected
+  skips; its sole reported failure is the stripped test image lacking `git` for
+  the repository secret-scan harness, and the same scan passes on the host.
+  Source compilation and whitespace validation pass. The local Kokoro live
+  canary `1784947714.116`, archived at
+  `logs/archived/rca-20260724-194952`, **failed the interactive-latency gate**
+  even though the media contract was correct. AudioSocket remained
+  `slin16@16000`, local STT recognized all three caller utterances, and Kokoro
+  returned truthful `linear16@16000`. However, the greeting took 9.28 seconds
+  to synthesize; the first 20.63-second conversational reply took 17.87 seconds,
+  and a 3.25-second reply took 4.02 seconds. The caller heard silence while
+  waiting and spoke again, correctly triggering TalkDetect cancellation before
+  each late response arrived. This is a whole-utterance local Kokoro CPU latency
+  limitation, not an AudioSocket, resampling, recognition, or false-barge-in
+  regression. Piper was restored on voiprnd. Local Kokoro wideband remains
+  implemented but **UNVALIDATED / NOT RELEASE-READY** until faster inference or
+  incremental synthesis is designed and tested.
+
 - **Diagnostics removed from the release candidate (2026-07-22):** every
   diagnostics-only change introduced during this investigation was reverted to
   `origin/main`. PR #555 does not change diagnostic YAML/environment
@@ -735,3 +831,308 @@ Validate audio quality and transport integrity across the maintainer-approved re
   path use the retained golden dataset; Local Full, `hybrid_elevenlabs`, and
   `telnyx_hybrid` are explicitly untested/non-blocking. `telephony_ulaw_8k`
   remains the GA wire baseline and alternate profiles remain experimental.
+
+## Opt-in 16 kHz AudioSocket expansion (2026-07-24)
+
+- [x] Prove Asterisk 20.17+ multirate AudioSocket framing on a direct G.722
+  extension with `wideband_pcm_16k`; call `1784929286.8` was objectively
+  `slin16@16000` and subjectively a clear improvement.
+- [x] Preserve every existing 8 kHz profile and provider default. Wideband
+  selection is per Agent/per call and remains immediately reversible.
+- [x] Declare provider-native wideband boundaries independently of the
+  Asterisk wire contract: ElevenLabs/Deepgram/Grok 16 kHz, Google 16 kHz input
+  and 24 kHz output, OpenAI 24 kHz input/output, and Local as 16 kHz input plus
+  opt-in native Piper/Kokoro `linear16@16000` output (legacy clients/profiles
+  remain mu-law/8 kHz).
+- [x] Extend supported modular TTS adapters to produce native PCM for a 16 kHz
+  call. OpenAI, Google, Deepgram, ElevenLabs, Groq, Azure, and CAMB AI opt in;
+  Local TTS now negotiates an optional protocol-v2 format/rate contract for
+  native Piper and Kokoro output while preserving the legacy response by
+  default.
+- [x] Add focused compatibility and per-call isolation coverage; the initial
+  transport/pipeline/provider-adapter suite passes 111/111. Google LINEAR16
+  and MULAW WAV containers are stripped before AudioSocket playback, and
+  Deepgram REST TTS explicitly requests `container=none` as recommended for
+  raw VoIP audio.
+- [x] Deploy frozen revisions to voiprnd and execute the maintainer-approved
+  direct-extension validation set, retaining excluded rows as explicitly
+  untested. Archive each call before analysis and retain objective and
+  subjective results.
+  - Revision `49f60b09` is deployed and healthy on voiprnd.
+  - ElevenLabs full-agent call `1784932129.24`, archived at
+    `logs/archived/rca-20260724-223012`, objectively passed the direct G.722 to
+    `slin16@16000` to provider PCM16/16 kHz path in both directions with no
+    resampling, zero RTP loss, functional barge-in, and clean teardown. The one
+    spoken seven-digit sequence was transcribed exactly but the demo agent
+    declined to repeat it; the sibilance phrase was transcribed and repeated
+    exactly. Subjective caller verdict is pending.
+  - Google Live call `1784932604.28`, archived at
+    `logs/archived/rca-20260724-223726`, passed objectively and subjectively.
+    G.722/16 kHz caller audio reached Google as linear PCM16/16 kHz without
+    input resampling; Google native 24 kHz PCM was converted once by the
+    profile-selected linear resampler to `slin16@16000`. The seven-digit and
+    sibilance rows were transcribed and repeated exactly, barge-in worked, RTP
+    loss was zero, teardown was clean, and the maintainer described the voice
+    quality as awesome/great. The conversion reports `alias_safe=false`, which
+    is retained as an explicit property of the compatibility linear policy.
+  - OpenAI Realtime call `1784932927.32`, archived at
+    `logs/archived/rca-20260724-224324`, passed the G.722 → 16 kHz AudioSocket →
+    OpenAI 24 kHz input and OpenAI 24→16 kHz output paths. Digits and the
+    sibilance phrase were exact, RTP loss was zero, normal-turn audio sounded
+    great, and teardown was clean. The row remains **PARTIAL** because startup
+    echo was admitted after provider generation ended but before the greeting
+    transport drained: OpenAI transcribed loopback fragments `you` and `Bye.`
+    and generated two unintended responses. The narrow correction will defer
+    only OpenAI greeting gating release through the existing caller-facing
+    drain observer; normal responses and other providers remain unchanged.
+  - OpenAI greeting retest `1784934934.36`, archived at
+    `logs/archived/rca-20260724-231549`, **failed** despite the engine gate being
+    retained to drain. The caller remained silent, but OpenAI's continuous-input
+    path bypassed `audio_capture_enabled`, detected its own still-playing
+    greeting at `16:15:40.548`, truncated 5,760 queued bytes, transcribed
+    `Good to go.`, and created an unsolicited response. This is not a new 16 kHz
+    regression: archived 8 kHz call `1784670034.942` shows the same pre-drain
+    speech-start and false `Bye.` transcript. The revised provider-scoped fix
+    sends provider-rate silence only during the initial OpenAI greeting, clears
+    OpenAI's input buffer at the verified transport-drain boundary, and then
+    restores normal full-duplex input. Other turns, providers, formats, and
+    resampler policies remain unchanged. The corrective revision passes 68
+    focused provider/lifecycle/transport tests and the full backend gate (2,010
+    passed, 7 skipped).
+  - OpenAI corrected greeting retest `1784936478.40`, archived at
+    `logs/archived/rca-20260724-234100`, **passed** on revision `e26a9e0a`.
+    Provider-rate silence was sent throughout the initial greeting; when
+    provider generation ended, 242,880 stream bytes and 19 jitter frames still
+    remained, and the guard correctly stayed active until caller-facing drain
+    completed at `16:41:30.840`. OpenAI's input buffer was then cleared before
+    the guard released. No speech-start, caller transcript, barge-in, or
+    unsolicited response occurred during the silent greeting window. The first
+    speech-start was real caller input more than 12 seconds after release;
+    OpenAI transcribed `731-9462` exactly and repeated all seven digits in
+    order. G.722/`slin16@16000`, zero RTP loss, and clean teardown were retained.
+    The OpenAI wideband full-agent row is now **PASS**.
+  - Grok full-agent call `1784936885.44`, archived at
+    `logs/archived/rca-20260724-234900`, **passed** objectively and
+    subjectively. `wideband_pcm_16k` resolved to `slin16@16000`, Grok accepted
+    and returned raw PCM16/16 kHz, and the engine skipped resampling. Grok
+    transcribed and repeated `7319462` exactly and transcribed the full
+    sibilance phrase exactly. Two AudioSocket local-VAD interruptions flushed
+    queued provider audio, truncated Grok's conversation item, and suppressed
+    stale audio. RTP loss was zero, teardown was clean, and the maintainer
+    described it as a great call with great quality. The Grok wideband
+    full-agent row is now **PASS**.
+  - Deepgram full-agent call `1784937142.48`, archived at
+    `logs/archived/rca-20260724-235400`, is **PARTIAL**. The Agent profile and
+    caller path resolved to `slin16@16000`, and Deepgram accepted linear16/16
+    kHz input, recognized all seven digits and the sibilance phrase exactly,
+    handled two local-VAD interruptions, and cleaned up normally. However, its
+    Settings payload still requested μ-law/8 kHz output. Root cause was a stale
+    constructor-time output-format cache created before call-owned transport
+    overrides were applied. The provider now refreshes its session output
+    baseline from the live per-call config when building Settings; 108 focused
+    Deepgram/provider/transport tests and the full backend gate (2,011 passed,
+    7 skipped) pass. A native 16/16 kHz live retest is required before marking
+    the row passed.
+  - Deepgram native-wideband retest `1784937530.52`, archived at
+    `logs/archived/rca-20260724-235900`, confirmed that the output correction
+    works: AudioSocket and both Deepgram directions were raw linear16/16 kHz,
+    the engine skipped output resampling, RTP loss was zero, teardown was clean,
+    and the maintainer found the audio quality good. The row remains
+    **PARTIAL** because barge-in failed. Deepgram emitted four
+    `UserStartedSpeaking` events while agent audio was active, but the adapter
+    only logged them; no engine `ProviderBargeIn`, playback stop, or queue flush
+    occurred. The adapter now bridges that native VAD signal to the existing
+    platform flush contract while retaining Deepgram-owned response
+    cancellation and terminal-farewell protection. The focused lifecycle,
+    transport, and realtime-provider gate passes 63 tests, and the full backend
+    gate passes 2,013 tests with 7 expected skips. A live barge-in retest is
+    pending.
+  - Deepgram barge-in retest `1784938060.56`, archived at
+    `logs/archived/rca-20260725-000835`, **passed** the intended media and
+    interruption behavior on revision `b551c8f5`. Deepgram and AudioSocket were
+    native linear16/16 kHz; five active-playback interruptions were applied
+    (four provider events and one local fallback), each replacement request was
+    recognized and answered, the complete terminal farewell was protected and
+    drained, and the maintainer reported that it worked perfectly. RTP QoS
+    reported 3 locally lost packets out of 2,239 received (~0.13%) and zero
+    remote loss, with no audible impairment. Post-call health was clean. The
+    call exposed three non-user-visible pending producer-task errors: abort
+    cleanup could wait forever while placing a sentinel into a full jitter
+    queue after its pacer was cancelled. Cancellation now uses a nonblocking
+    sentinel write while natural completion retains ordered drain semantics;
+    111 focused transport/lifecycle tests and the full 2,014-test backend gate
+    (7 expected skips) pass. Cleanup retest `1784938538.60`, archived at
+    `logs/archived/rca-20260725-001642`, retained native 16 kHz media, six
+    functional interruptions, protected farewell, low RTP loss, and clean
+    post-call health, but **failed** the internal lifecycle gate: one producer
+    cancelled at a full jitter-queue enqueue remained pending beyond the
+    two-second stop wait and was garbage-collected. The remaining wait was not
+    the sentinel; it was the producer's duplicate async finalization (including
+    session persistence) racing the caller-owned stop cleanup. The stop path now
+    marks itself as the sole cleanup owner before cancellation, and an externally
+    stopped producer propagates cancellation without entering duplicate async
+    finalization. A regression test reproduces a full queue plus a permanently
+    blocked final session write and verifies cancellation/cleanup within 200 ms.
+    The focused transport suite passes 49 tests. The broad backend run passes
+    1,985 tests with 18 expected skips; six updater tests initially failed only
+    because the minimal test image lacked `/usr/bin/python3`, and that complete
+    updater suite passes 33/33 with the prerequisite present. The final live
+    verification below closes the cleanup gate.
+  - Final Deepgram cleanup verification `1784939486.64`, archived at
+    `logs/archived/rca-20260725-003248`, **passed** on revision `ca340f02`.
+    AudioSocket and both Deepgram directions remained raw linear16/16 kHz. Seven
+    active-playback interruptions were applied (six provider events and one
+    local fallback); all replacement requests were recognized and answered.
+    Eight cancelled producers yielded cleanup ownership to the stop path, all
+    eight matching stream cleanups completed, and there were zero stop-timeout,
+    pending-task, traceback, exception, or runtime-error events. Interrupt
+    cleanup settled in roughly 3–10 ms, while the terminal farewell drained and
+    cleaned up in approximately 205 ms. RTP loss was 2 of 2,595 received packets
+    (about 0.077%) with zero remote loss and low jitter. Post-call health was
+    clean with no active resources. Combined with the maintainer's prior
+    subjective wideband-quality acceptance, the Deepgram full-agent wideband
+    row is now **PASS**.
+  - Hybrid ElevenLabs call `1784939918.68`, archived at
+    `logs/archived/rca-20260725-003955`, is **FAILED / INVALID FOR WIDEBAND
+    COMPARISON**. The custom dialplan selected `AI_PROVIDER=hybrid_elevenlabs`,
+    but audio-profile resolution treated that pipeline name as an unknown
+    monolithic provider and returned before applying the Agent's
+    `wideband_pcm_16k` profile. The call consequently used μ-law/8 kHz in
+    ElevenLabs and `slin@8000` on AudioSocket; the maintainer reported aggressive
+    clipping. RTP QoS was healthy, but repeated TalkDetect interruptions
+    intentionally truncated several responses, and one aborted pipeline TTS
+    producer remained blocked on its full jitter queue past the stop timeout.
+    The correction recognizes an explicit configured pipeline during profile
+    resolution, preserving the selected Agent profile, and discards queued tail
+    audio before abort cancellation so the producer cannot remain blocked.
+    Focused profile, pipeline-output, and streaming lifecycle coverage passes
+    88 tests. The broad backend suite passes 1,985 tests with 18 expected skips;
+    its seven reported failures are environment-only because the minimal test
+    container lacks `git` and system `python3`, matching the previously verified
+    updater-test prerequisite limitation. A true 16 kHz Hybrid ElevenLabs live
+    retest is required.
+  - Hybrid ElevenLabs profile-handoff retest `1784940689.72`, archived at
+    `logs/archived/rca-20260725-005225`, is **FAILED / INVALID FOR WIDEBAND
+    COMPARISON**. The previous profile-resolution fix worked: the pipeline
+    selected `wideband_pcm_16k`, originated `c(slin16)`, and requested native
+    ElevenLabs `pcm_16000`. However, pipeline streaming callers omitted the
+    already-resolved per-call target when opening playback, so the streaming
+    manager fell back to its process-wide `slin@8000` default and downsampled
+    provider audio at the final boundary. The call also reproduced a perceived
+    self-hearing/cutoff issue: TalkDetect events queued during playback resumed
+    4–8 ms after gating cleared and applied three stale barge-in actions at the
+    exact tail of the greeting/reply. No self-transcript was generated, but the
+    false tail interruption explains the audible behavior. Streaming playback
+    now inherits the target encoding/rate from the call-owned transport profile
+    whenever a caller omits explicit targets, and TalkDetect revalidates current
+    gating after its async work before applying barge-in. The focused AudioSocket,
+    pipeline, gating, and cleanup suite passes 151 tests. A clean native 16 kHz
+    live retest remains required.
+  - Hybrid ElevenLabs native-wideband retest `1784941103.76`, archived at
+    `logs/archived/rca-20260725-005924`, proved the corrected media path:
+    AudioSocket, local STT, ElevenLabs `pcm_16000`, and streaming playback all
+    remained native 16 kHz. It also isolated the remaining clipping to false
+    Asterisk TalkDetect barge-in. Each conversational reply was stopped after
+    only about 0.84–0.86 seconds when the global DSP magnitude threshold of 256
+    treated playback echo as caller speech; no self-transcript was generated.
+  - PCM-only barge-in canary `1784941554.80`, archived at
+    `logs/archived/rca-20260725-010659`, disabled TalkDetect and confirmed full,
+    unclipped 16 kHz responses (including a 31.58-second response). It also
+    showed that PCM-only fallback is not viable on this endpoint: AudioSocket
+    delivered RMS-0 caller frames for the complete TTS gates, so intentional
+    caller speech could not form a barge-in candidate.
+  - Hybrid ElevenLabs threshold canary `1784941838.84`, archived at
+    `logs/archived/rca-20260725-011138`, **passed**. Restored TalkDetect with a
+    DSP magnitude threshold of 1000 preserved the complete 10.46-second greeting
+    and 7.68-second farewell while three real caller overlaps interrupted active
+    responses and produced matching subsequent transcripts. Media remained
+    native 16 kHz, teardown and post-call health were clean, and the maintainer
+    reported that it worked perfectly. The threshold is now carried by the
+    opt-in `wideband_pcm_16k` Audio Profile rather than changing the global 256
+    default used by existing 8 kHz profiles. Backend validation, runtime
+    resolution, UI display/editing, and focused regression coverage are included.
+  - Final profile-scoped call `1784942426.88`, archived at
+    `logs/archived/rca-20260725-012132`, confirmed that the temporary global
+    override was absent and the live call selected
+    `threshold_source=audio_profile`, `talking_threshold=1000`. Native 16 kHz
+    ordinary replies and three real caller interruptions worked. The calendar
+    tool turn exposed a separate **FAILED** media path: after the tool result,
+    the legacy LLM-continuation branch wrote 237,772 bytes of ElevenLabs
+    PCM16/16 kHz to a `.ulaw` file. Asterisk interpreted the approximately
+    7.43-second response as 29.72 seconds of μ-law/8 kHz and produced the
+    caller-reported garbled audio. Tool continuation TTS now uses the same
+    call-owned negotiated stream as ordinary pipeline responses, drains before
+    follow-up work, and persists the tool/result continuation in call history.
+    Focused regression coverage verifies linear16/16 kHz source metadata and
+    that all PCM chunks drain through streaming. A live meeting-tool retest is
+    required before the Hybrid ElevenLabs pipeline row can pass.
+  - Calendar continuation retest `1784942907.92`, archived at
+    `logs/archived/rca-20260725-013123`, **passed** and closes the Hybrid
+    ElevenLabs wideband row. The Microsoft calendar lookup succeeded;
+    ElevenLabs produced 364,088 bytes of `pcm_16000`, and the continuation
+    streamed as `linear16@16000 -> slin16@16000` for 11.4 effective seconds with -2.6%
+    pacing drift. No audio file or `.ulaw` event occurred. Stream gating and
+    cleanup completed, later turns stayed native 16 kHz, the 165-second call
+    ended cleanly, and post-call health had no active resources. The maintainer
+    confirmed the calendar response sounded normal and the call worked fine.
+  - Local Hybrid native-wideband call `1784946127.104`, archived at
+    `logs/archived/rca-20260725-022309`, **passed** on revision `bd3e8216`.
+    AudioSocket, Local STT, and Local Piper TTS remained native PCM16/16 kHz;
+    caller-facing playback required no output conversion. Normal turns and the
+    fully drained farewell were subjectively accepted. The long greeting was
+    interrupted by real caller speech after the existing five-second greeting
+    protection window, matching the earlier 8 kHz control rather than exposing
+    a wideband regression.
+  - Local Hybrid Kokoro native-wideband canary `1784947714.116`, archived at
+    `logs/archived/rca-20260724-194952`, **failed** the interactive-latency
+    gate. The 16 kHz contract and local STT were correct, but local Kokoro's
+    whole-utterance CPU synthesis took 9.28 seconds for the greeting, 17.87
+    seconds for a 20.63-second reply, and 4.02 seconds for a 3.25-second reply.
+    The maintainer heard silence after the greeting and spoke again; the two
+    resulting TalkDetect actions correctly canceled the late replies. This row
+    remains **UNVALIDATED / NOT RELEASE-READY**, and voiprnd was restored to
+    Piper.
+  - Public G.722 trunk matrix on revision `23044911` validated Grok
+    (`1784954386.176`), Google (`1784954445.180`), Deepgram
+    (`1784954498.184`), OpenAI (`1784954557.188`), Local Hybrid
+    (`1784954701.192`), and ElevenLabs (`1784954766.196`). Asterisk reported
+    `(g722)` on every caller leg, and all six agents/pipelines used AudioSocket
+    `slin16@16000`, exchanged conversational media, cleaned up, and left green
+    health with no active resources. The test also exposed an observer defect
+    where parenthesized Asterisk format values were logged as `ulaw@8000`; the
+    branch now strips the presentation parentheses before codec mapping.
+  - Full Local call `1784954842.200` is **FAILED / NOT A WIDEBAND TEST** because
+    that Agent retained `slin@8000`. Its greeting, STT, 10.15-second local LLM,
+    and Piper synthesis all completed, but the engine rejected the 72,725-byte
+    reply because the server emitted binary audio without a `tts_audio` header
+    when the continuous request lacked a `request_id`. The protocol correction
+    now always scopes binary audio with metadata and keeps `request_id`
+    optional. Narrowband Local TTS also resolves to its supported μ-law/8 kHz
+    contract instead of requesting invalid `linear16@8000` on every frame. A
+    focused Full Local retest is required after deployment. The correction was
+    deployed to voiprnd with exact source hashes verified inside both rebuilt
+    containers; Local AI and engine health are green with zero restarts. The
+    focused gate passes 130 tests and the broad backend gate passes 1,899 tests
+    with 6 expected skips and 139 deselections.
+  - Full Local compatibility retest `1784955816.212`, archived at
+    `logs/archived/rca-20260725-050500`, **passed**. Asterisk's `(g722)` value
+    normalized correctly to `slin16@16000`, while the Agent intentionally kept
+    its legacy `slin@8000` profile. Four caller turns were recognized. The
+    initial Qwen/Piper answer generated 71,982 μ-law bytes and drained 144,000
+    AudioSocket wire bytes over 9.0 seconds; two later replies also drained
+    completely. There were zero unscoped Local audio drops, invalid
+    `linear16@8000` warnings, exceptions, or leaked resources. This closes the
+    Full Local protocol regression and the public-trunk validation matrix.
+- [x] Run the full backend/frontend regression gates. Backend passed 1,981
+  tests with 18 skips; frontend passed 222 tests, production build, and lint
+  with existing warnings only. Focused wideband/provider/pipeline coverage
+  passed 111 tests with one skip; compile, secret, release-doc, and diff checks
+  passed.
+- [x] Complete the live validation matrix with pass/partial/untested
+  classifications and prepare the branch for the repository PR workflow.
+
+Release guidance: `wideband_pcm_16k` is an AudioSocket-only opt-in. Recommend it
+only when the SIP endpoint or trunk provider supports and actually negotiates
+G.722 (or another true wideband codec). Keep PSTN/G.711 routes and all
+ExternalMedia RTP deployments on `telephony_ulaw_8k` or
+`telephony_enhanced_8k`.
