@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.5.2] - 2026-07-25
+
 ### Added
 
 - **Per-call 16 kHz AudioSocket transport:** the `wideband_pcm_16k` Audio Profile now selects Asterisk `slin16` and the rate-specific AudioSocket `0x12` frame type in both directions without changing the global transport or other active calls. Inbound decoding follows the AudioSocket header instead of guessing from payload length, while the existing 8 kHz profiles retain `slin`/`0x10`. Wideband calls fail closed with a clear compatibility error unless ARI reports Asterisk 20.17+, 21.12+, 22.7+, or 23.1+.
 - **Native Local TTS wideband output:** Local AI Server protocol v2 can negotiate `linear16@16000` per call for Piper and Kokoro while legacy clients and unsupported Local backends retain truthful μ-law/8 kHz responses. Piper converts once from native 22.05 kHz PCM; Kokoro local converts once from its reported native PCM rate, and Kokoro API mode decodes the WAV-reported rate before conversion. Cache keys and response metadata remain format/rate scoped. Piper is the live-validated CPU path; the local Kokoro CPU canary preserved the media contract but did not meet the interactive-latency gate, so operators should benchmark Kokoro on their own hardware before enabling it for calls.
+- **Provider and pipeline wideband negotiation:** Grok, Google Live, Deepgram Voice Agent, OpenAI Realtime, ElevenLabs, Local Hybrid, and Full Local preserve call-scoped audio contracts without mutating shared provider templates. The Admin UI exposes the opt-in profile and its AudioSocket-only compatibility boundary.
+
+### Fixed
+
+- **Wideband playback, interruption, and continuation integrity:** per-frame AudioSocket format/rate metadata now drives VAD and resampling, μ-law stream tails use format-correct silence, Deepgram retry settings retain negotiated output, OpenAI greeting fallback releases its transport guard, and pipeline tool continuations drain through the same negotiated stream as ordinary replies.
+- **Local protocol and routing isolation:** Local AI zero-byte and failure responses retain truthful negotiated metadata, continuous Full Local audio remains request-scoped even without a request ID, and an explicit dialplan `AI_PROVIDER` is no longer replaced by a pipeline-only Agent context during transport resolution.
+
+### Compatibility
+
+- `wideband_pcm_16k` is opt-in and requires AudioSocket plus a genuinely wideband endpoint or trunk leg such as G.722. ExternalMedia RTP and PSTN/G.711 routes remain on `telephony_ulaw_8k` or `telephony_enhanced_8k`. Rollback is assigning the Agent back to an 8 kHz profile.
 
 ## [7.5.1] - 2026-07-23
 
@@ -2258,7 +2270,8 @@ Version 4.1 introduces **unified tool calling architecture** enabling AI agents 
 - **v4.0.0** (2025-10-29) - Modular pipeline architecture, production monitoring, golden baselines
 - **v3.0.0** (2025-09-16) - Modular pipeline architecture, file based playback
 
-[Unreleased]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.5.1...HEAD
+[Unreleased]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.5.2...HEAD
+[7.5.2]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.5.1...v7.5.2
 [7.5.1]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.5.0...v7.5.1
 [7.5.0]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.4.1...v7.5.0
 [7.4.1]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.4.0...v7.4.1

@@ -18,6 +18,15 @@ Active and upcoming work. Pick something up and [get involved](#how-to-contribut
 
 Outbound dialer shipped as Alpha in v5.0.0 — core scheduling, AMD, voicemail drop, consent gate, and Admin UI are working. Current focus: DNC, retry automation, outcome classification, and resilience hardening (see Phases 6-8 in spec).
 
+### v7.5.2 — Opt-in AudioSocket HD Voice (Shipped July 2026)
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **16 kHz AudioSocket profile** | `wideband_pcm_16k` provides call-scoped `slin16` framing without changing existing 8 kHz defaults. | ✅ Shipped |
+| **Wideband provider and pipeline alignment** | Full-agent providers and modular pipelines preserve negotiated format/rate through playback, interruption, retries, tool continuations, and cleanup. | ✅ Shipped |
+| **Local wideband protocol** | Piper and Kokoro can emit truthful PCM16/16 kHz metadata while legacy and unsupported backends retain μ-law/8 kHz compatibility. | ✅ Shipped |
+| **G.722 public demo path** | The HD Voice demo trunk and release matrix validate the wideband path while retaining the standard demo number for compatibility calls. | ✅ Shipped |
+
 ### v7.5.1 — Apply Safety and Transcript Integrity (Shipped July 2026)
 
 | Feature | Description | Status |
@@ -223,4 +232,4 @@ Longer-term goals that will shape the project's direction:
 
 ---
 
-**Last Updated**: July 2026 | **Latest Stable**: v7.5.1 | **Next**: Unreleased
+**Last Updated**: July 2026 | **Latest Stable**: v7.5.2 | **Next**: Unreleased

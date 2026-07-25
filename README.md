@@ -6,7 +6,7 @@
   <img alt="Asterisk AI Voice Agent" src="assets/banner_light_mode.png?v=9" width="100%">
 </picture>
 
-![Version](https://img.shields.io/badge/version-7.5.1-blue.svg)
+![Version](https://img.shields.io/badge/version-7.5.2-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-compose-blue.svg)
@@ -167,6 +167,30 @@ docker compose -p asterisk-ai-voice-agent logs -f ai_engine
 ## 🎉 What's New
 
 <details open>
+<summary><b>v7.5.2 — Opt-in HD Voice over 16 kHz AudioSocket</b></summary>
+
+v7.5.2 adds a call-scoped wideband path without changing existing Agent
+profiles or the established 8 kHz compatibility defaults.
+
+- **Native 16 kHz AudioSocket** — assign `wideband_pcm_16k` to an Agent to use
+  Asterisk `slin16` and rate-specific AudioSocket framing in both directions.
+- **Provider and pipeline alignment** — Grok, Google Live, Deepgram, OpenAI,
+  ElevenLabs, Local Hybrid, and Full Local retain truthful per-call media
+  contracts, including retries, tool continuations, interruption, and cleanup.
+- **Fail-closed compatibility** — wideband requires Asterisk 20.17+, 21.12+,
+  22.7+, or 23.1+ and a genuinely wideband endpoint or SIP trunk path such as
+  G.722. ExternalMedia RTP and PSTN/G.711 calls remain on an 8 kHz profile.
+- **Simple rollback** — switch the Agent back to `telephony_ulaw_8k` or
+  `telephony_enhanced_8k`; no global transport or provider-default change is
+  required.
+
+See the [v7.5.2 changelog](CHANGELOG.md#752---2026-07-25),
+[v7.5.2 upgrade notes](docs/INSTALLATION.md#upgrade-to-v752-existing-checkout),
+and [validation matrix](docs/baselines/golden/v7.5.2-validation-matrix.md).
+
+</details>
+
+<details>
 <summary><b>v7.5.1 — Safer Admin apply and complete call history</b></summary>
 
 The v7.5.1 hotfix focuses on recovery and observability without changing audio
@@ -186,7 +210,7 @@ No database migration or audio-profile reassignment is required. Existing
 stored transcripts are not rewritten.
 
 See the [v7.5.1 changelog](CHANGELOG.md#751---2026-07-23) and
-[v7.5.1 upgrade notes](docs/INSTALLATION.md#upgrade-to-v751-existing-checkout).
+[v7.5.1 migration notes](docs/MIGRATION.md#v750-to-v751).
 
 </details>
 
@@ -278,7 +302,7 @@ voicemail mailboxes it should be allowed to use.**
   working.
 
 Before upgrading—especially from v7.3.0–v7.3.3—read the
-[current upgrade procedure](docs/INSTALLATION.md#upgrade-to-v751-existing-checkout)
+[current upgrade procedure](docs/INSTALLATION.md#upgrade-to-v752-existing-checkout)
 and [Contexts → Agents migration guide](docs/OPERATOR_MIGRATION.md).
 
 </details>
@@ -732,9 +756,11 @@ Experience our production-ready configurations with a single phone call:
 - **Standard Voice:** (925) 736-6718
 - **HD Voice:** (909) 788-2282
 
-The HD Voice demo line uses a G.722-capable SIP trunk. Wideband audio is
-available when the caller's carrier and device negotiate a G.722 path; other
-calls fall back to standard telephony audio.
+The HD Voice demo line uses a G.722-capable SIP trunk and Agents assigned the
+opt-in `wideband_pcm_16k` Audio Profile. Wideband audio is available when the
+caller's carrier and device negotiate a G.722 path; other calls fall back to
+standard telephony audio. The clearer sound comes from both pieces: the trunk
+must preserve G.722 and AAVA must keep the call on its 16 kHz AudioSocket path.
 
 - **Press 4** → xAI Grok Realtime (NEW in v6.5.2)
 - **Press 5** → Google Live API (Multimodal AI with Gemini 2.0)

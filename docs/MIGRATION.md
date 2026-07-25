@@ -2,6 +2,31 @@
 
 This guide covers upgrading between major versions of Asterisk AI Voice Agent.
 
+## v7.5.1 to v7.5.2
+
+v7.5.2 is an in-place, backward-compatible audio release. It does not migrate
+databases, rewrite Agent assignments, or change the default Audio Profile.
+Existing Agents remain on their current 8 kHz behavior after upgrade.
+
+After upgrading:
+
+1. Rebuild and recreate `ai_engine`, `local_ai_server`, and `admin_ui` so the
+   engine, Local protocol, and profile controls use the same release.
+2. Verify the engine and Local AI health endpoints before returning calls to
+   service.
+3. Keep current PSTN/G.711 and ExternalMedia RTP Agents on
+   `telephony_ulaw_8k` or `telephony_enhanced_8k`.
+4. Opt in to `wideband_pcm_16k` only after confirming AudioSocket, a supported
+   Asterisk version (20.17+, 21.12+, 22.7+, or 23.1+), and a caller leg that
+   actually negotiates a wideband codec such as G.722.
+5. Make a controlled test call and confirm the Transport Card reports
+   `slin16@16000` before enabling additional Agents.
+
+Rollback requires no database action: assign the Agent back to an 8 kHz Audio
+Profile and apply the configuration. Local Kokoro can emit a truthful 16 kHz
+contract, but CPU latency is hardware-dependent; Piper is the validated Local
+TTS baseline for interactive calls.
+
 ## v7.5.0 to v7.5.1
 
 v7.5.1 is an in-place hotfix with no database migration, audio-profile change,
