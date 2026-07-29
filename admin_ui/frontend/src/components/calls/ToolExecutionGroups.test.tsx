@@ -97,4 +97,64 @@ describe('InCallToolGroup', () => {
 
         expect(screen.getByText('call-fallback-1')).toBeInTheDocument();
     });
+
+    it('shows the recorded policy and irrecoverable sanitized paths', () => {
+        render(
+            <InCallToolGroup
+                entries={[{
+                    type: 'tool_result',
+                    call_id: 'call-redacted',
+                    name: 'blind_transfer',
+                    params: { destination: 'REDACTED' },
+                    target_id: 'REDACTED',
+                    result: 'success',
+                    redaction_mode: 'strict',
+                    redacted_fields: ['params.destination', 'target_id'],
+                    timestamp: '2026-07-29T04:00:00+00:00',
+                    duration_ms: 8,
+                }]}
+            />,
+        );
+
+        expect(screen.getByText('Strict redaction')).toBeInTheDocument();
+        expect(screen.getByText(/params\.destination, target_id/)).toBeInTheDocument();
+        expect(screen.getByText(/Original values cannot be recovered/)).toBeInTheDocument();
+        expect(screen.getByRole('link', { name: 'Configure future calls' })).toHaveAttribute(
+            'href',
+            '/env?section=call-history#system'
+        );
+    });
+
+    it('shows a mixed policy for strict and metadata-free legacy entries', () => {
+        render(
+            <InCallToolGroup
+                entries={[
+                    {
+                        type: 'tool_result',
+                        call_id: 'call-mixed',
+                        tool_call_id: 'tool-strict',
+                        name: 'blind_transfer',
+                        params: { destination: '***REDACTED***' },
+                        result: 'success',
+                        redaction_mode: 'strict',
+                        timestamp: '2026-07-29T04:00:00+00:00',
+                        duration_ms: 8,
+                    },
+                    {
+                        type: 'tool_result',
+                        call_id: 'call-mixed',
+                        tool_call_id: 'tool-legacy',
+                        name: 'hangup_call',
+                        params: {},
+                        result: 'success',
+                        timestamp: '2026-07-29T04:00:01+00:00',
+                        duration_ms: 3,
+                    },
+                ]}
+            />,
+        );
+
+        expect(screen.getByText('Mixed redaction policies')).toBeInTheDocument();
+        expect(screen.queryByText('Strict redaction')).not.toBeInTheDocument();
+    });
 });

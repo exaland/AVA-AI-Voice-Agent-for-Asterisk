@@ -73,13 +73,15 @@ append-only reduction contract:
   "type": "tool_result",
   "call_id": "1785299332.302",
   "tool_call_id": "provider-call-7",
-  "name": "google_calendar",
-  "action": "create_event",
+  "name": "blind_transfer",
+  "action": "blind_transfer",
   "status": "success",
-  "target_id": "calendar-event-42",
-  "params": {"action": "create_event"},
+  "target_id": "***REDACTED***",
+  "params": {"destination": "***REDACTED***"},
   "result": "success",
-  "message": "Event created",
+  "message": "Transfer accepted for ***REDACTED***",
+  "redaction_mode": "strict",
+  "redacted_fields": ["params.destination", "target_id", "message"],
   "timestamp": "2026-07-29T04:00:00+00:00",
   "duration_ms": 121.4
 }
@@ -96,10 +98,19 @@ append-only reduction contract:
   `create_event` followed by `delete_event` reconcile to zero net creations.
 - `status` is normalized to `success` or `failure`; `result` retains the legacy
   raw status for backward compatibility.
-- `params` is a diagnostic view, not an execution replay payload. Credentials,
-  caller PII/free text, and routing targets are recursively redacted before
-  persistence; the original parameters are used only for execution. The
-  explicit top-level `target_id` remains available for reducer reconciliation.
+- `params` is a diagnostic view, not an execution replay payload. Its persistence
+  policy is controlled by `CALL_HISTORY_TOOL_REDACTION_MODE`: `strict` (the
+  default) redacts credentials, caller PII/free text, and routing targets;
+  `show_routing` preserves destinations/extensions/queues/mailboxes while still
+  redacting credentials and caller data; `off` stores tool diagnostics verbatim.
+  Invalid values fail closed to `strict`. The original parameters are always used
+  for execution, regardless of the persistence policy.
+- New entries include `redaction_mode` and `redacted_fields`. Under `strict`, a
+  routing-derived top-level `target_id` is redacted along with its parameter;
+  resource identifiers needed for reducers (for example, calendar event ids)
+  remain available. Messages that echo a redacted parameter are sanitized too.
+  Policy changes affect future entries only, and historical `***REDACTED***` values
+  cannot be recovered.
 - The event records the tool execution fact only. A successful voicemail route
   does not claim that a message was recorded, and a successful transfer does
   not claim that a human answered.
