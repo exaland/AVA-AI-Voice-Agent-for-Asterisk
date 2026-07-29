@@ -139,6 +139,7 @@ def _make_engine(on_provider_failure: str, prompt: str = "custom/oops"):
     engine.ari_client = MagicMock()
     engine.ari_client.play_sound = AsyncMock(return_value={"id": "pb-123"})
     engine.ari_client.hangup_channel = AsyncMock()
+    engine.ari_client.send_command = AsyncMock()
     engine.ari_client.dialplan_target_exists = AsyncMock(return_value=True)
     engine.ari_client.continue_in_dialplan = AsyncMock(return_value=True)
     # Heavy collaborators stubbed: not under test here.
@@ -409,8 +410,58 @@ async def test_failed_provider_failure_redirect_restores_cleanup_and_hangs_up():
 
     assert session.transfer_active is False
     assert session.transfer_state is None
+    engine.ari_client.send_command.assert_not_awaited()
     engine.ari_client.play_sound.assert_awaited_once()
     engine.ari_client.hangup_channel.assert_awaited_once_with("chan-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "presence",
+    [
+        {"id": "chan-1", "state": "Up"},
+        {"status": 404},
+        {"status": 503},
+        None,
+    ],
+)
+async def test_indeterminate_provider_failure_redirect_retains_ownership(
+    presence,
+):
+    engine = _make_engine("dialplan_redirect")
+    engine.ari_client.continue_in_dialplan.return_value = None
+    engine.ari_client.send_command = AsyncMock(return_value=presence)
+    session = await _register_session(engine)
+
+    await engine._start_provider_session("call-1")
+
+    assert session.transfer_active is True
+    assert session.transfer_state == "provider_failure_redirect"
+    assert session.transfer_target == "aava-provider-failure,s,1"
+    engine.ari_client.send_command.assert_not_awaited()
+    engine.ari_client.play_sound.assert_not_awaited()
+    engine.ari_client.hangup_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_redirect_exceptions_retain_ownership():
+    engine = _make_engine("dialplan_redirect")
+    engine.ari_client.continue_in_dialplan.side_effect = RuntimeError(
+        "continue response lost"
+    )
+    engine.ari_client.send_command = AsyncMock(
+        side_effect=RuntimeError("presence probe unavailable")
+    )
+    session = await _register_session(engine)
+
+    await engine._start_provider_session("call-1")
+
+    assert session.transfer_active is True
+    assert session.transfer_state == "provider_failure_redirect"
+    assert session.transfer_target == "aava-provider-failure,s,1"
+    engine.ari_client.send_command.assert_not_awaited()
+    engine.ari_client.play_sound.assert_not_awaited()
+    engine.ari_client.hangup_channel.assert_not_awaited()
 
 
 def test_unknown_provider_failure_policy_is_rejected_at_config_load():

@@ -46,6 +46,28 @@ describe('configCache', () => {
         }
     );
 
+    it.each([
+        '/api/config/providers/openai_realtime/audio/reset',
+        '/api/config/profiles/telephony_ulaw_8k/audio/reset',
+        '/api/config/pipelines/local_only/audio/reset',
+    ])('invalidates the cache when an audio reset at %s succeeds', async (url) => {
+        vi.mocked(axios.get).mockResolvedValue({ data: { content: 'k: 1' } });
+        await loadConfigYaml();
+        expect(getCachedConfig()).not.toBeNull();
+        handleConfigWrite({ config: { method: 'post', url } });
+        expect(getCachedConfig()).toBeNull();
+    });
+
+    it.each([
+        '/api/config/providers/openai_realtime/audio',
+        '/api/config/providers/openai_realtime/reset',
+    ])('does not invalidate the cache for non-reset audio path %s', async (url) => {
+        vi.mocked(axios.get).mockResolvedValue({ data: { content: 'k: 1' } });
+        await loadConfigYaml();
+        handleConfigWrite({ config: { method: 'post', url } });
+        expect(getCachedConfig()).not.toBeNull();
+    });
+
     it('ignores writes to other endpoints', async () => {
         vi.mocked(axios.get).mockResolvedValue({ data: { content: 'k: 1' } });
         await loadConfigYaml();

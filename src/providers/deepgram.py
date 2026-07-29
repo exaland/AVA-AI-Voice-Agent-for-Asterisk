@@ -398,6 +398,7 @@ class DeepgramProvider(AIProviderInterface):
         self.websocket: Optional[ClientConnection] = None
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._receive_task: Optional[asyncio.Task] = None
+        self._settings_failure_stop_task: Optional[asyncio.Task] = None
         self._is_audio_flowing = False
         self.request_id: Optional[str] = None
         self.session_id: Optional[str] = None
@@ -849,6 +850,7 @@ class DeepgramProvider(AIProviderInterface):
         
         # Add tools from context allowlist only.
         # Per Deepgram docs: functions go in agent.think.functions.
+        tools_schemas: List[Dict[str, Any]] = []
         try:
             tools_schemas = self.tool_adapter.get_tools_config(list(self._allowed_tools or []))
             if tools_schemas:
@@ -892,6 +894,8 @@ class DeepgramProvider(AIProviderInterface):
                     "speak": { "provider": { "type": "deepgram", "model": speak_model } }
                 }
             }
+            if tools_schemas:
+                self._last_settings_minimal["agent"]["think"]["functions"] = tools_schemas
         except Exception:
             self._last_settings_minimal = None
         self._last_settings_payload = settings
@@ -1306,6 +1310,25 @@ class DeepgramProvider(AIProviderInterface):
             except Exception as send_error:
                 logger.error(f"Failed to send error response: {send_error}")
 
+    def _schedule_settings_failure_stop(self) -> None:
+        """Keep the fail-closed stop task alive until it completes."""
+        current = self._settings_failure_stop_task
+        if current and not current.done():
+            return
+
+        task = asyncio.create_task(
+            self.stop_session(),
+            name=f"deepgram-settings-failure-stop-{self.call_id}",
+        )
+        self._settings_failure_stop_task = task
+
+        def _done(completed: asyncio.Task) -> None:
+            if self._settings_failure_stop_task is completed:
+                self._settings_failure_stop_task = None
+            _log_provider_task_exception(completed)
+
+        task.add_done_callback(_done)
+
     async def stop_session(self):
         # Prevent duplicate disconnect logs/ops
         if self._closed or self._closing:
@@ -1638,17 +1661,43 @@ class DeepgramProvider(AIProviderInterface):
                                 if not self._settings_retry_attempted and self._last_settings_minimal and self.websocket and self.websocket.state.name == "OPEN":
                                     try:
                                         self._settings_retry_attempted = True
-                                        logger.warning("Deepgram Settings error; retrying with minimal Settings", call_id=self.call_id)
+                                        logger.warning(
+                                            "Deepgram Settings error; retrying with capability-preserving Settings",
+                                            call_id=self.call_id,
+                                            function_count=len(
+                                                self._last_settings_minimal
+                                                .get("agent", {})
+                                                .get("think", {})
+                                                .get("functions", [])
+                                            ),
+                                        )
                                         await self.websocket.send(json.dumps(self._last_settings_minimal))
                                         # Do not continue here; allow loop to process next server message
                                     except Exception:
-                                        logger.debug("Failed to send minimal Settings retry", exc_info=True)
+                                        logger.error(
+                                            "Failed to send Deepgram Settings retry; closing session",
+                                            call_id=self.call_id,
+                                            exc_info=True,
+                                        )
+                                        self._settings_acked = False
+                                        self._ready_to_stream = False
+                                        self._schedule_settings_failure_stop()
+                                        return
                                 else:
-                                    try:
-                                        asyncio.create_task(self.stop_session())
-                                    except Exception:
-                                        pass
-                                    continue
+                                    if self._settings_retry_attempted:
+                                        logger.error(
+                                            "Deepgram Settings negotiation failed after retry; closing session",
+                                            call_id=self.call_id,
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Deepgram Settings negotiation failed; retry unavailable; closing session",
+                                            call_id=self.call_id,
+                                        )
+                                    self._settings_acked = False
+                                    self._ready_to_stream = False
+                                    self._schedule_settings_failure_stop()
+                                    return
                             if isinstance(event_data, dict) and et == "ConversationText":
                                 try:
                                     role = event_data.get("role")

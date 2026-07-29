@@ -602,34 +602,14 @@ class UnifiedTransferTool(Tool):
             or self._resolve_dialplan_context("extension", {}, config if isinstance(config, dict) else {})
         )
         
-        # Set transfer_active flag BEFORE continue() - this prevents cleanup
-        # from hanging up the caller when StasisEnd fires
-        await context.update_session(
-            transfer_active=True,
+        return await self._continue_to_dialplan(
+            context=context,
+            target=str(extension or "").strip(),
+            description=description,
+            transfer_type="extension",
+            dialplan_context=dialplan_context,
             transfer_state="transferring",
-            transfer_target=description
         )
-        
-        # Use ARI continue to transfer via dialplan (like queue/ringgroup transfers)
-        # This properly leaves Stasis and lets Asterisk dialplan handle the call
-        await context.ari_client.send_command(
-            method="POST",
-            resource=f"channels/{context.caller_channel_id}/continue",
-            params={
-                "context": dialplan_context,
-                "extension": extension,
-                "priority": 1
-            }
-        )
-        
-        logger.info("✅ Extension transfer initiated", 
-                   call_id=context.call_id, extension=extension, context=dialplan_context)
-        return {
-            "status": "success",
-            "message": f"Transferring you to {description} now.",
-            "destination": extension,
-            "type": "extension"
-        }
     
     async def _transfer_to_queue(
         self,
@@ -660,34 +640,14 @@ class UnifiedTransferTool(Tool):
             or self._resolve_dialplan_context("queue", {}, config if isinstance(config, dict) else {})
         )
         
-        # Set transfer_active flag BEFORE continue() - this prevents cleanup
-        # from hanging up the caller when StasisEnd fires
-        await context.update_session(
-            transfer_active=True,
+        return await self._continue_to_dialplan(
+            context=context,
+            target=str(queue or "").strip(),
+            description=description,
+            transfer_type="queue",
+            dialplan_context=dialplan_context,
             transfer_state="in_queue",
-            transfer_target=description
         )
-        
-        # Execute transfer to FreePBX ext-queues context
-        await context.ari_client.send_command(
-            method="POST",
-            resource=f"channels/{context.caller_channel_id}/continue",
-            params={
-                "context": dialplan_context,
-                "extension": queue,
-                "priority": 1
-            }
-        )
-        
-        logger.info("✅ Queue transfer initiated", call_id=context.call_id, 
-                   queue=queue)
-        
-        return {
-            "status": "success",
-            "message": f"Transferring you to {description} now.",
-            "destination": queue,
-            "type": "queue"
-        }
     
     async def _transfer_to_ringgroup(
         self,
@@ -718,31 +678,163 @@ class UnifiedTransferTool(Tool):
             or self._resolve_dialplan_context("ringgroup", {}, config if isinstance(config, dict) else {})
         )
         
-        # Set transfer_active flag BEFORE continue() - this prevents cleanup
-        # from hanging up the caller when StasisEnd fires
+        return await self._continue_to_dialplan(
+            context=context,
+            target=str(ringgroup or "").strip(),
+            description=description,
+            transfer_type="ringgroup",
+            dialplan_context=dialplan_context,
+            transfer_state="in_ringgroup",
+        )
+
+    async def _continue_to_dialplan(
+        self,
+        *,
+        context: ToolExecutionContext,
+        target: str,
+        description: str,
+        transfer_type: str,
+        dialplan_context: str,
+        transfer_state: str,
+    ) -> Dict[str, Any]:
+        """Validate and hand caller ownership to a concrete dialplan target."""
+        priority = 1
+        target_exists: Optional[bool] = None
+        validator = getattr(context.ari_client, "dialplan_target_exists", None)
+        if callable(validator):
+            try:
+                target_exists = await validator(
+                    context.caller_channel_id,
+                    context=dialplan_context,
+                    extension=target,
+                    priority=priority,
+                )
+            except Exception:
+                logger.warning(
+                    "Dialplan target validation unavailable",
+                    call_id=context.call_id,
+                    transfer_type=transfer_type,
+                    target=target,
+                    context=dialplan_context,
+                    exc_info=True,
+                )
+
+        if target_exists is False:
+            logger.error(
+                "Transfer dialplan target does not exist",
+                call_id=context.call_id,
+                transfer_type=transfer_type,
+                target=target,
+                context=dialplan_context,
+                priority=priority,
+            )
+            return {
+                "status": "failed",
+                "message": f"Transfer destination {description} is not available.",
+                "destination": target,
+                "type": transfer_type,
+            }
+
+        if target_exists is not True:
+            logger.warning(
+                "Dialplan target could not be pre-validated; attempting guarded transfer",
+                call_id=context.call_id,
+                transfer_type=transfer_type,
+                target=target,
+                context=dialplan_context,
+                priority=priority,
+            )
+
+        session = await context.get_session()
+        previous_transfer_state = {
+            "transfer_active": bool(getattr(session, "transfer_active", False)),
+            "transfer_state": getattr(session, "transfer_state", None),
+            "transfer_target": getattr(session, "transfer_target", None),
+        }
+
+        # StasisEnd can race the HTTP response. Claim transfer ownership before
+        # continue so normal cleanup cannot hang up a successfully handed-off leg.
         await context.update_session(
             transfer_active=True,
-            transfer_state="in_ringgroup",
-            transfer_target=description
+            transfer_state=transfer_state,
+            transfer_target=description,
         )
-        
-        # Execute transfer to FreePBX ext-group context
-        await context.ari_client.send_command(
-            method="POST",
-            resource=f"channels/{context.caller_channel_id}/continue",
-            params={
-                "context": dialplan_context,
-                "extension": ringgroup,
-                "priority": 1
+
+        try:
+            handed_off = await context.ari_client.continue_in_dialplan(
+                context.caller_channel_id,
+                context=dialplan_context,
+                extension=target,
+                priority=priority,
+            )
+        except Exception:
+            handed_off = None
+            logger.warning(
+                "Transfer dialplan handoff raised",
+                call_id=context.call_id,
+                transfer_type=transfer_type,
+                target=target,
+                context=dialplan_context,
+                exc_info=True,
+            )
+
+        handoff_indeterminate = handed_off is not True and handed_off is not False
+
+        if handed_off is True:
+            logger.info(
+                "Dialplan transfer initiated",
+                call_id=context.call_id,
+                transfer_type=transfer_type,
+                target=target,
+                context=dialplan_context,
+            )
+            return {
+                "status": "success",
+                "message": f"Transferring you to {description} now.",
+                "destination": target,
+                "type": transfer_type,
             }
+
+        # Only an explicit rejection proves the channel remained under AAVA
+        # ownership. An indeterminate response may have followed an accepted
+        # handoff, so retain the transfer guard and avoid destructive cleanup.
+        restore_ownership = handed_off is False
+        if restore_ownership:
+            try:
+                await context.update_session(**previous_transfer_state)
+            except Exception:
+                logger.error(
+                    "Failed to restore transfer ownership after unconfirmed handoff",
+                    call_id=context.call_id,
+                    transfer_type=transfer_type,
+                    target=target,
+                    context=dialplan_context,
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "Transfer handoff outcome indeterminate; retaining transfer ownership",
+                call_id=context.call_id,
+                transfer_type=transfer_type,
+                target=target,
+                context=dialplan_context,
+            )
+
+        logger.error(
+            "Transfer dialplan handoff was not confirmed",
+            call_id=context.call_id,
+            transfer_type=transfer_type,
+            target=target,
+            context=dialplan_context,
+            handoff_indeterminate=handoff_indeterminate,
+            ownership_restored=restore_ownership,
         )
-        
-        logger.info("✅ Ring group transfer initiated", call_id=context.call_id,
-                   ringgroup=ringgroup)
-        
-        return {
-            "status": "success",
-            "message": f"Transferring you to {description} now.",
-            "destination": ringgroup,
-            "type": "ringgroup"
+        result = {
+            "status": "failed",
+            "message": f"Unable to transfer to {description}.",
+            "destination": target,
+            "type": transfer_type,
         }
+        if handoff_indeterminate:
+            result["handoff_indeterminate"] = True
+        return result

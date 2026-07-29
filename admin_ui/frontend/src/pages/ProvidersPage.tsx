@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
@@ -13,6 +13,8 @@ import { Modal } from '../components/ui/Modal';
 import HelpTooltip from '../components/ui/HelpTooltip';
 import { useRestartRequired } from '../hooks/useRestartRequired';
 import { localAIStatusFromLiveSnapshot } from '../utils/liveStatus';
+import AudioResetButton from '../components/config/AudioResetButton';
+import AudioEnvironmentOverrideWarning from '../components/config/AudioEnvironmentOverrideWarning';
 
 // Provider Forms
 import GenericProviderForm from '../components/config/providers/GenericProviderForm';
@@ -28,6 +30,7 @@ import TelnyxProviderForm from '../components/config/providers/TelnyxProviderFor
 import AzureProviderForm from '../components/config/providers/AzureProviderForm';
 import { Capability, capabilityFromKey, ensureModularKey, isFullAgentProvider, getEffectiveFullAgentKind } from '../utils/providerNaming';
 import { GOOGLE_LIVE_DEFAULT_MODEL } from '../utils/googleLiveModels';
+import { enforceOpenAIRealtimeGaAudioContract } from '../utils/providerAudioContracts';
 
 const stripModularSuffix = (name: string): string => (name || '').replace(/_(stt|llm|tts)$/i, '');
 const FULL_AGENT_TYPES = ['openai_realtime', 'deepgram', 'google_live', 'elevenlabs_agent', 'grok', 'local'];
@@ -40,6 +43,7 @@ const ProvidersPage: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(() => getCachedConfig()?.yamlError ?? null);
     const [editingProvider, setEditingProvider] = useState<string | null>(null);
+    const editingProviderRef = useRef<string | null>(null);
     const [providerForm, setProviderForm] = useState<any>({});
     const [isNewProvider, setIsNewProvider] = useState(false);
     const [testingProvider, setTestingProvider] = useState<string | null>(null);
@@ -89,6 +93,7 @@ const ProvidersPage: React.FC = () => {
             setConfig(r.config);
             setYamlError(r.yamlError);
             setError(null);
+            return r.config;
         } catch (err) {
             console.error('Failed to load config', err);
             const status = (err as any)?.response?.status;
@@ -98,8 +103,25 @@ const ProvidersPage: React.FC = () => {
                 setError('Failed to load configuration. Check backend logs and try again.');
             }
             setYamlError(null);
+            return null;
         } finally {
             setLoading(false);
+        }
+    };
+
+    const updateEditingProvider = (providerKey: string | null) => {
+        editingProviderRef.current = providerKey;
+        setEditingProvider(providerKey);
+    };
+
+    const handleProviderAudioResetComplete = async (resetProvider: string) => {
+        const refreshed = await fetchConfig(true);
+        await refetch();
+        if (refreshed && editingProviderRef.current === resetProvider) {
+            const providerData = refreshed.providers?.[resetProvider];
+            if (providerData) {
+                setProviderForm({ ...providerData, name: resetProvider });
+            }
         }
     };
 
@@ -166,7 +188,7 @@ const ProvidersPage: React.FC = () => {
     };
 
     const handleEditProvider = (name: string) => {
-        setEditingProvider(name);
+        updateEditingProvider(name);
         const providerData = { ...(config.providers?.[name] || {}) };
 
         // Only infer concrete type when YAML didn't specify one. Rewriting
@@ -211,7 +233,7 @@ const ProvidersPage: React.FC = () => {
     };
 
     const handleAddProvider = () => {
-        setEditingProvider('new');
+        updateEditingProvider('new');
         setProviderForm({
             name: '',
             type: 'openai_realtime',
@@ -382,7 +404,9 @@ const ProvidersPage: React.FC = () => {
                 if (!template) {
                     return;
                 }
-                nextProviders[templateKey] = template;
+                nextProviders[templateKey] = templateKey === 'openai_realtime'
+                    ? enforceOpenAIRealtimeGaAudioContract(template)
+                    : template;
                 changed = true;
             }
         });
@@ -543,6 +567,7 @@ const ProvidersPage: React.FC = () => {
         }
 
         const isFull = isFullAgentProvider(providerForm);
+        let fullAgentKind: string | null = null;
         let finalName = (providerForm.name || '').toLowerCase();
         let capabilities = Array.isArray(providerForm.capabilities) ? providerForm.capabilities : [];
 
@@ -569,8 +594,8 @@ const ProvidersPage: React.FC = () => {
             // canonical legacy entry (e.g. google_live: { type: full }) validates
             // and saves without forcing a type change. #436
             const fullAgentKey = isNewProvider ? finalName : (editingProvider || '');
-            const effectiveKind = getEffectiveFullAgentKind(providerForm, fullAgentKey);
-            if (!effectiveKind || !FULL_AGENT_TYPES.includes(effectiveKind)) {
+            fullAgentKind = getEffectiveFullAgentKind(providerForm, fullAgentKey);
+            if (!fullAgentKind || !FULL_AGENT_TYPES.includes(fullAgentKind)) {
                 toast.error('Select a full-agent provider type.');
                 return;
             }
@@ -612,7 +637,13 @@ const ProvidersPage: React.FC = () => {
         }
 
         const existingData = !isNewProvider && editingProvider ? (config.providers?.[editingProvider] || {}) : {};
-        const providerData = { ...existingData, ...providerForm, name: finalName, capabilities };
+        let providerData = { ...existingData, ...providerForm, name: finalName, capabilities };
+        if (fullAgentKind === 'openai_realtime') {
+            // Normalize again at the persistence boundary. Async form updates
+            // (for example credential operations) can otherwise reintroduce a
+            // stale Beta audio pair after the operator switches to GA.
+            providerData = enforceOpenAIRealtimeGaAudioContract(providerData);
+        }
 
         // Telnyx LLM defaults: ensure the values shown in the form are actually persisted to YAML.
         // Without this, the form may display placeholders while the YAML remains unset, causing ai_engine
@@ -666,7 +697,7 @@ const ProvidersPage: React.FC = () => {
         newConfig.providers[finalName] = providerData;
 
         await saveConfig(newConfig);
-        setEditingProvider(null);
+        updateEditingProvider(null);
     };
 
     const handleTestConnection = async (name: string, providerData: any) => {
@@ -850,6 +881,8 @@ const ProvidersPage: React.FC = () => {
                     </button>
                 </div>
             )}
+
+            <AudioEnvironmentOverrideWarning />
 
             <div className="flex justify-between items-center">
                 <div>
@@ -1141,7 +1174,7 @@ const ProvidersPage: React.FC = () => {
 
             <Modal
                 isOpen={!!editingProvider}
-                onClose={() => setEditingProvider(null)}
+                onClose={() => updateEditingProvider(null)}
                 title={isNewProvider ? 'Add Provider' : `Edit Provider: ${editingProvider}`}
                 size="lg"
                 footer={
@@ -1170,7 +1203,7 @@ const ProvidersPage: React.FC = () => {
                         </div>
                         <div className="flex gap-2">
                             <button
-                                onClick={() => setEditingProvider(null)}
+                                onClick={() => updateEditingProvider(null)}
                                 className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-input bg-background shadow-sm hover:bg-accent hover:text-accent-foreground h-9 px-4 py-2"
                             >
                                 Cancel
@@ -1378,6 +1411,22 @@ const ProvidersPage: React.FC = () => {
                                     </div>
                                 );
                             })()}
+                        </div>
+                    )}
+
+                    {!isNewProvider && editingProvider && (
+                        <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                                <div className="text-sm font-semibold">Audio recovery</div>
+                                <p className="mt-1 text-xs text-muted-foreground">
+                                    Restore the shipped audio contract for this provider without changing credentials, models, voices, prompts, or provider identity.
+                                </p>
+                            </div>
+                            <AudioResetButton
+                                scope="provider"
+                                target={editingProvider}
+                                onResetComplete={() => handleProviderAudioResetComplete(editingProvider)}
+                            />
                         </div>
                     )}
 

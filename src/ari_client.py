@@ -421,8 +421,15 @@ class ARIClient:
         extension: str = "s",
         priority: int = 1,
         label: Optional[str] = None,
-    ) -> bool:
-        """Return a Stasis channel back to the dialplan (POST /channels/{id}/continue)."""
+    ) -> Optional[bool]:
+        """Return the tri-state outcome of handing a Stasis channel to dialplan.
+
+        A 2xx response confirms acceptance, an explicit 4xx response rejects the
+        command, and ``None`` represents an indeterminate 5xx, missing, redirect,
+        or malformed response. Callers must retain ownership while reconciling an
+        indeterminate result because Asterisk may have accepted the request before
+        the HTTP response was lost.
+        """
         params: Dict[str, Any] = {
             "context": str(context),
             "extension": str(extension),
@@ -432,9 +439,17 @@ class ARIClient:
             params["label"] = str(label)
         resp = await self.send_command("POST", f"channels/{channel_id}/continue", params=params)
         status = resp.get("status") if isinstance(resp, dict) else None
-        if status is not None and int(status) >= 400:
+        if status is None:
+            return None
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            return None
+        if 200 <= status_code < 300:
+            return True
+        if 400 <= status_code < 500:
             return False
-        return True
+        return None
 
     async def dialplan_target_exists(
         self,
@@ -443,8 +458,13 @@ class ARIClient:
         context: str,
         extension: str = "s",
         priority: int = 1,
-    ) -> bool:
+    ) -> Optional[bool]:
         """Return whether a concrete dialplan destination exists for this channel.
+
+        ``None`` means Asterisk could not answer the discovery probe. Callers that
+        require fail-closed recovery can treat it as false, while normal transfer
+        paths may still attempt ``continue`` and use that command's result as the
+        authoritative handoff outcome.
 
         ARI can accept ``continue`` before Asterisk resolves the destination.  An
         invalid target therefore looks successful to the caller of
@@ -494,19 +514,24 @@ class ARIClient:
                 priority=priority,
                 exc_info=True,
             )
-            return False
+            return None
 
         if not isinstance(resp, dict):
-            return False
+            return None
         status = resp.get("status")
-        if status is not None and int(status) >= 400:
+        if status is not None:
+            try:
+                if int(status) >= 400:
+                    return None
+            except (TypeError, ValueError):
+                return None
+
+        value = str(resp.get("value") or "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
             return False
-        return str(resp.get("value") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        return None
 
     async def answer_channel(self, channel_id: str):
         """Answer a channel."""

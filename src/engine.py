@@ -3010,22 +3010,41 @@ class Engine:
 
         # Exiting Stasis triggers StasisEnd; guard cleanup until AMD returns.
         self._outbound_awaiting_amd_channel_ids.add(channel_id)
-        ok = await self.ari_client.continue_in_dialplan(
-            channel_id,
-            context=self._outbound_amd_context,
-            extension="s",
-            priority=1,
-        )
-        if not ok:
-            logger.warning("Outbound AMD continueInDialplan failed", channel_id=channel_id, attempt_id=attempt_id)
-            self._outbound_awaiting_amd_channel_ids.discard(channel_id)
-            if meta:
-                await self.outbound_store.finish_attempt(attempt_id, outcome="error", error_message="continueInDialplan failed")
-                try:
-                    await self.outbound_store.set_lead_state(str(meta.get("lead_id") or ""), state="failed", last_outcome="error")
-                except Exception:
-                    pass
-            await self.ari_client.hangup_channel(channel_id)
+        try:
+            ok = await self.ari_client.continue_in_dialplan(
+                channel_id,
+                context=self._outbound_amd_context,
+                extension="s",
+                priority=1,
+            )
+        except Exception:
+            ok = None
+            logger.warning(
+                "Outbound AMD continueInDialplan raised",
+                channel_id=channel_id,
+                attempt_id=attempt_id,
+                exc_info=True,
+            )
+
+        if ok is True:
+            return
+        if ok is None:
+            logger.warning(
+                "Outbound AMD handoff indeterminate; retaining caller ownership guard",
+                channel_id=channel_id,
+                attempt_id=attempt_id,
+            )
+            return
+
+        logger.warning("Outbound AMD continueInDialplan failed", channel_id=channel_id, attempt_id=attempt_id)
+        self._outbound_awaiting_amd_channel_ids.discard(channel_id)
+        if meta:
+            await self.outbound_store.finish_attempt(attempt_id, outcome="error", error_message="continueInDialplan failed")
+            try:
+                await self.outbound_store.set_lead_state(str(meta.get("lead_id") or ""), state="failed", last_outcome="error")
+            except Exception:
+                pass
+        await self.ari_client.hangup_channel(channel_id)
 
     async def _handle_outbound_amd_result(self, channel_id: str, channel: Dict[str, Any], args: List[Any]) -> None:
         """
@@ -3212,6 +3231,10 @@ class Engine:
             channel_id = channel.get("id")
             if not channel_id:
                 return
+            # A destroyed channel can never return from the AMD dialplan hop.
+            # Release the StasisEnd guard even when attempt metadata was already
+            # consumed so indeterminate handoffs do not leak channel IDs.
+            self._outbound_awaiting_amd_channel_ids.discard(channel_id)
 
             meta = self._outbound_attempt_meta_by_channel_id.get(channel_id)
             if not meta:
@@ -3529,11 +3552,6 @@ class Engine:
                     if not deepgram_config:
                         continue
 
-                    # Validate OpenAI dependency for Deepgram
-                    if not self.config.llm.api_key:
-                        logger.error("Deepgram provider requires OpenAI API key in LLM config")
-                        continue
-
                     hangup_policy = resolve_hangup_policy(
                         getattr(self.config, "tools", None)
                     )
@@ -3558,7 +3576,11 @@ class Engine:
                         key,
                         p_kind,
                     )
-                    logger.info("Provider loaded successfully with OpenAI LLM dependency.", provider=name, kind=kind)
+                    logger.info(
+                        "Provider loaded successfully with Deepgram-managed reasoning",
+                        provider=name,
+                        kind=kind,
+                    )
 
                     runtime_issues = self._describe_provider_alignment(name, provider)
                     if runtime_issues:
@@ -18804,7 +18826,7 @@ class Engine:
                             priority=priority,
                         )
                     except Exception:
-                        redirected = False
+                        redirected = None
                         logger.warning(
                             "Provider-failure dialplan redirect raised",
                             call_id=session.call_id,
@@ -18813,7 +18835,7 @@ class Engine:
                             priority=priority,
                             exc_info=True,
                         )
-                    if redirected:
+                    if redirected is True:
                         logger.info(
                             "Provider-failure dialplan redirect initiated",
                             call_id=session.call_id,
@@ -18823,8 +18845,18 @@ class Engine:
                         )
                         return
 
-                    # Continue failed: restore cleanup ownership before using the
-                    # safe announcement/hangup fallback.
+                    if redirected is None:
+                        logger.warning(
+                            "Provider-failure redirect indeterminate; retaining transfer ownership",
+                            call_id=session.call_id,
+                            context=context,
+                            extension=extension,
+                            priority=priority,
+                        )
+                        return
+
+                    # Only an explicit rejection can safely restore cleanup
+                    # ownership before using the announcement/hangup fallback.
                     session.transfer_active = False
                     session.transfer_state = None
                     session.transfer_target = None

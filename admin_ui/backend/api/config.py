@@ -2,16 +2,20 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, SequenceNode, ScalarNode
+import errno
 import os
 import re
 import asyncio
 import glob
 import sqlite3
+import stat
 import tempfile
 import sys
+import threading
 import logging
 import ssl
 import smtplib
+from copy import deepcopy
 from email.message import EmailMessage
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,11 +39,16 @@ MAX_BACKUPS = 5
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+# Transactions call _write_local_config(), which re-enters this lock while
+# preserving the writer's direct-call safety for tests and synchronous helpers.
+_CONFIG_UPDATE_LOCK = threading.RLock()
 
 
 def _assert_in_use_audio_profiles_unchanged(
     old_config: Dict[str, Any],
     new_config: Dict[str, Any],
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
 ) -> None:
     """Fail closed before mutating a profile referenced by an Agent.
 
@@ -59,6 +68,17 @@ def _assert_in_use_audio_profiles_unchanged(
         for name in (set(old_profiles) | set(new_profiles)) - {"default"}
         if old_profiles.get(name) != new_profiles.get(name)
     }
+    if trusted_profile_reset is not None:
+        reset_name, expected_body = trusted_profile_reset
+        # This exception is deliberately value-bound.  Callers cannot bypass
+        # the Agent-reference guard merely by naming a profile: the resulting
+        # body must be the exact backend-owned canonical reset value.
+        if (
+            reset_name != "default"
+            and reset_name in changed_profiles
+            and new_profiles.get(reset_name) == expected_body
+        ):
+            changed_profiles.remove(reset_name)
     configured_old_default = old_profiles.get("default")
     old_default_profile = (
         configured_old_default.strip()
@@ -388,23 +408,37 @@ def _read_merged_config_content() -> str:
 
 def _write_local_config(content: str) -> None:
     """
-    Atomically write *content* to the local override config file.
+    Write *content* to the local override config file.
 
     Creates a backup of the existing local file (if any), validates permissions,
-    and performs an atomic temp-file + rename write.
+    and normally performs an atomic temp-file + rename write. Docker cannot
+    replace a path that is itself a bind-mount target (``EBUSY``), so that
+    topology falls back to a validated, fsynced in-place rewrite with automatic
+    rollback to the backup if the rewrite fails.
     """
+    with _CONFIG_UPDATE_LOCK:
+        _write_local_config_locked(content)
+
+
+def _write_local_config_locked(content: str) -> None:
+    """Persist local config while the process-wide writer lock is held."""
     import datetime
     dir_path = os.path.dirname(settings.LOCAL_CONFIG_PATH)
     if dir_path:
         os.makedirs(dir_path, exist_ok=True)
 
     # Backup existing local file
+    previous_bytes: Optional[bytes] = None
+    backup_path: Optional[str] = None
     if os.path.exists(settings.LOCAL_CONFIG_PATH):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = f"{settings.LOCAL_CONFIG_PATH}.bak.{timestamp}"
-        with open(settings.LOCAL_CONFIG_PATH, "r") as src:
-            with open(backup_path, "w") as dst:
-                dst.write(src.read())
+        with open(settings.LOCAL_CONFIG_PATH, "rb") as src:
+            previous_bytes = src.read()
+            with open(backup_path, "wb") as dst:
+                dst.write(previous_bytes)
+                dst.flush()
+                os.fsync(dst.fileno())
         _rotate_backups(settings.LOCAL_CONFIG_PATH)
 
     # Preserve permissions from existing local or base file
@@ -414,14 +448,96 @@ def _write_local_config(content: str) -> None:
             original_mode = os.stat(candidate).st_mode
             break
 
-    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as f:
-        f.write(content)
+    desired_bytes = content.encode("utf-8")
+    with tempfile.NamedTemporaryFile("wb", dir=dir_path, delete=False, suffix=".tmp") as f:
+        f.write(desired_bytes)
+        f.flush()
+        os.fsync(f.fileno())
         temp_path = f.name
 
     if original_mode is not None:
         os.chmod(temp_path, original_mode)
 
-    os.replace(temp_path, settings.LOCAL_CONFIG_PATH)
+    try:
+        os.replace(temp_path, settings.LOCAL_CONFIG_PATH)
+        temp_path = ""
+    except OSError as exc:
+        if exc.errno != errno.EBUSY:
+            raise
+
+        # A file mounted directly into a container is a mount point and cannot
+        # be replaced, even when the mount is writable. The desired content has
+        # already passed schema validation and is staged in the adjacent temp
+        # file. Rewrite the mounted inode, fsync it, and restore the pre-write
+        # snapshot if any part of the fallback fails.
+        try:
+            target_stat = os.stat(settings.LOCAL_CONFIG_PATH)
+        except OSError as stat_exc:
+            raise OSError(
+                errno.EBUSY,
+                "Refusing bind-mount fallback because the local config target "
+                "cannot be inspected",
+                settings.LOCAL_CONFIG_PATH,
+            ) from stat_exc
+        if previous_bytes is None or not stat.S_ISREG(target_stat.st_mode):
+            raise OSError(
+                errno.EBUSY,
+                "Refusing bind-mount fallback without an existing regular "
+                "local config file",
+                settings.LOCAL_CONFIG_PATH,
+            ) from exc
+
+        logger.warning(
+            "Atomic config replace unavailable for bind-mounted file; "
+            "using fsynced in-place rewrite",
+            extra={"path": settings.LOCAL_CONFIG_PATH},
+        )
+        try:
+            with open(settings.LOCAL_CONFIG_PATH, "r+b") as dst:
+                dst.seek(0)
+                dst.write(desired_bytes)
+                dst.truncate()
+                dst.flush()
+                os.fsync(dst.fileno())
+            with open(settings.LOCAL_CONFIG_PATH, "rb") as current:
+                if current.read() != desired_bytes:
+                    raise OSError(
+                        errno.EIO,
+                        "Bind-mounted local config verification failed",
+                    )
+        except Exception as write_exc:
+            try:
+                with open(settings.LOCAL_CONFIG_PATH, "r+b") as dst:
+                    dst.seek(0)
+                    dst.write(previous_bytes)
+                    dst.truncate()
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                with open(settings.LOCAL_CONFIG_PATH, "rb") as restored:
+                    if restored.read() != previous_bytes:
+                        raise OSError(
+                            errno.EIO,
+                            "Bind-mounted local config rollback verification failed",
+                        )
+            except Exception as rollback_exc:
+                recovery_path = backup_path or "unavailable"
+                raise OSError(
+                    errno.EIO,
+                    "Bind-mounted local config write failed and automatic "
+                    f"recovery failed; restore backup {recovery_path}",
+                    settings.LOCAL_CONFIG_PATH,
+                ) from rollback_exc
+            raise write_exc
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.warning(
+                    "Failed to remove staged local config temp file",
+                    extra={"path": temp_path},
+                    exc_info=True,
+                )
 
 
 # Regex to strip ANSI escape codes from logs
@@ -740,7 +856,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     return {"warnings": warnings}
 
 
-def persist_config_content(content: str) -> dict:
+def persist_config_content(
+    content: str,
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
     """
     Validate and persist a full merged ai-agent config (YAML string).
 
@@ -752,6 +872,19 @@ def persist_config_content(content: str) -> dict:
 
     Raises ``HTTPException`` on validation failure (propagated to the caller).
     """
+    with _CONFIG_UPDATE_LOCK:
+        return _persist_config_content_locked(
+            content,
+            trusted_profile_reset=trusted_profile_reset,
+        )
+
+
+def _persist_config_content_locked(
+    content: str,
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
+    """Persist a complete config while the shared update lock is held."""
     # MED-E1: reject malformed tool email addresses (422) on EVERY persistence
     # path. Both the Raw YAML editor (POST /yaml) and the structured tools CRUD
     # API (api/tools.py -> _persist_cfg) funnel through here, so centralizing the
@@ -768,6 +901,18 @@ def persist_config_content(content: str) -> dict:
     if not isinstance(new_parsed, dict):
         raise HTTPException(status_code=400, detail="Config YAML must be a mapping at the top level")
 
+    # Persist the canonical replacement for the exact v7.5.2 OpenAI audio
+    # typo. Runtime load performs the same migration so an existing local
+    # override cannot prevent startup; rewriting on the next save removes the
+    # stale pair from operator-owned YAML as well.
+    from src.config.normalization import normalize_legacy_openai_audio
+
+    if normalize_legacy_openai_audio(new_parsed):
+        content = yaml.dump(new_parsed, default_flow_style=False, sort_keys=False)
+        validation = _validate_ai_agent_config(content)
+        migrated_warnings = validation.get("warnings")
+        warnings = warnings if migrated_warnings is None else migrated_warnings
+
     if _migrate_inline_provider_secrets(new_parsed):
         content = yaml.dump(new_parsed, default_flow_style=False, sort_keys=False)
         validation = _validate_ai_agent_config(content)
@@ -780,7 +925,11 @@ def persist_config_content(content: str) -> dict:
     # Audio profiles are referenced from the independent Agent store. Guard
     # every persistence path (structured pages and Raw YAML), not only the
     # frontend button flow, before writing the local override.
-    _assert_in_use_audio_profiles_unchanged(old_merged, new_parsed)
+    _assert_in_use_audio_profiles_unchanged(
+        old_merged,
+        new_parsed,
+        trusted_profile_reset=trusted_profile_reset,
+    )
 
     # Convert desired merged config into a minimal local override (supports deletions).
     base = _read_base_config_dict()
@@ -846,6 +995,201 @@ async def reconcile_apply_result_with_engine_state(result: dict) -> dict:
     return reconciled
 
 
+def _audio_baseline_helpers() -> dict[str, Any]:
+    """Load canonical audio baseline helpers in source and image layouts."""
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.config.audio_baselines import (
+        BUILTIN_PROFILE_BASELINES,
+        PIPELINE_AUDIO_FIELDS,
+        PROVIDER_AUDIO_BASELINES,
+        profile_audio_baseline,
+        provider_audio_baseline,
+        provider_audio_fields,
+    )
+
+    return {
+        "pipeline_fields": PIPELINE_AUDIO_FIELDS,
+        "provider_baselines": PROVIDER_AUDIO_BASELINES,
+        "profile_baselines": BUILTIN_PROFILE_BASELINES,
+        "profile_baseline": profile_audio_baseline,
+        "provider_baseline": provider_audio_baseline,
+        "provider_fields": provider_audio_fields,
+    }
+
+
+def _get_resettable_provider_block(
+    provider_key: str,
+) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    """Resolve a configured provider instance to its canonical audio kind."""
+    instance_helpers = _provider_instances_module()
+    try:
+        instance_helpers["validate_provider_key"](provider_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers")
+    if not isinstance(providers, dict):
+        raise HTTPException(status_code=404, detail="No providers are configured")
+    provider_cfg = providers.get(provider_key)
+    if not isinstance(provider_cfg, dict):
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found")
+
+    baseline_helpers = _audio_baseline_helpers()
+    known_kinds = baseline_helpers["provider_baselines"]
+    full_agent_kind = instance_helpers["provider_kind"](provider_key, provider_cfg)
+    candidates = [full_agent_kind, provider_key]
+
+    capabilities = provider_cfg.get("capabilities") or []
+    if isinstance(capabilities, str):
+        capabilities = [capabilities]
+    roles = [role for role in ("stt", "tts") if role in capabilities]
+    raw_type = str(provider_cfg.get("type") or "").strip()
+    if len(roles) == 1 and raw_type:
+        candidates.append(f"{raw_type}_{roles[0]}")
+
+    audio_kind = next(
+        (str(candidate) for candidate in candidates if candidate in known_kinds),
+        None,
+    )
+    if audio_kind is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Provider '{provider_key}' does not have a recognized audio "
+                "baseline"
+            ),
+        )
+    return merged, provider_cfg, audio_kind
+
+
+async def _persist_audio_reset(
+    merged: Dict[str, Any],
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
+    """Persist a reset without blocking the Admin UI event loop."""
+    content = yaml.dump(merged, default_flow_style=False, sort_keys=False)
+    result = await asyncio.to_thread(
+        persist_config_content,
+        content,
+        trusted_profile_reset=trusted_profile_reset,
+    )
+    return await reconcile_apply_result_with_engine_state(result)
+
+
+@router.post("/providers/{provider_key}/audio/reset")
+async def reset_provider_audio(provider_key: str):
+    """Restore a provider instance's managed audio fields to its baseline."""
+    merged, provider_cfg, audio_kind = _get_resettable_provider_block(provider_key)
+    helpers = _audio_baseline_helpers()
+    baseline = helpers["provider_baseline"](audio_kind)
+    if baseline is None:  # Defensive; resolver only returns registered kinds.
+        raise HTTPException(status_code=400, detail="Provider audio baseline not found")
+
+    updated_provider = deepcopy(provider_cfg)
+    reset_fields = helpers["provider_fields"](audio_kind)
+    for field in reset_fields:
+        updated_provider.pop(field, None)
+    updated_provider.update(baseline)
+    merged["providers"][provider_key] = updated_provider
+
+    result = await _persist_audio_reset(merged)
+    return {
+        **result,
+        "provider_key": provider_key,
+        "provider_kind": audio_kind,
+        "audio_baseline": baseline,
+    }
+
+
+@router.get("/profiles/audio/baselines")
+async def get_profile_audio_baselines():
+    """List profile names backed by canonical shipped audio baselines."""
+    helpers = _audio_baseline_helpers()
+    return {"built_in_profiles": sorted(helpers["profile_baselines"])}
+
+
+@router.post("/profiles/{profile_name}/audio/reset")
+async def reset_profile_audio(profile_name: str):
+    """Restore an existing profile to its built-in or telephony baseline."""
+    if profile_name == "default":
+        raise HTTPException(status_code=400, detail="profiles.default is a selector, not a profile")
+    merged = _read_merged_config_dict()
+    profiles = merged.get("profiles")
+    if not isinstance(profiles, dict) or not isinstance(profiles.get(profile_name), dict):
+        raise HTTPException(status_code=404, detail=f"Audio profile '{profile_name}' not found")
+
+    helpers = _audio_baseline_helpers()
+    built_in = profile_name in helpers.get("profile_baselines", {})
+    # The helper deliberately maps custom profiles to the standard 8 kHz
+    # telephony body while preserving the custom profile key.
+    baseline = helpers["profile_baseline"](profile_name)
+    profiles[profile_name] = baseline
+
+    result = await _persist_audio_reset(
+        merged,
+        trusted_profile_reset=(profile_name, baseline),
+    )
+    return {
+        **result,
+        "profile_name": profile_name,
+        "baseline_kind": "built_in" if built_in else "standard_telephony",
+        "audio_baseline": baseline,
+    }
+
+
+@router.post("/pipelines/{pipeline_name}/audio/reset")
+async def reset_pipeline_audio(pipeline_name: str):
+    """Remove pipeline audio overrides so profile policy is inherited."""
+    merged = _read_merged_config_dict()
+    pipelines = merged.get("pipelines")
+    if not isinstance(pipelines, dict) or pipeline_name not in pipelines:
+        raise HTTPException(status_code=404, detail=f"Pipeline '{pipeline_name}' not found")
+    pipeline = pipelines.get(pipeline_name)
+    removed: Dict[str, Dict[str, Any]] = {}
+    if isinstance(pipeline, dict):
+        helpers = _audio_baseline_helpers()
+        options = pipeline.get("options")
+        if isinstance(options, dict):
+            for role, fields in helpers["pipeline_fields"].items():
+                role_options = options.get(role)
+                if not isinstance(role_options, dict):
+                    continue
+                role_removed = {
+                    field: role_options.pop(field)
+                    for field in tuple(role_options)
+                    if field in fields
+                }
+                if role_removed:
+                    removed[role] = role_removed
+
+    if not removed:
+        # Legacy shorthand and dict pipelines without audio overrides already
+        # inherit profile audio policy, so do not rotate a backup or rewrite
+        # the local override file.
+        return {
+            "status": "success",
+            "apply_required": False,
+            "restart_required": False,
+            "recommended_apply_method": "none",
+            "apply_plan": [],
+            "message": "Pipeline already inherits profile audio policy.",
+            "warnings": [],
+            "pipeline_name": pipeline_name,
+            "removed_audio_overrides": {},
+        }
+
+    result = await _persist_audio_reset(merged)
+    return {
+        **result,
+        "pipeline_name": pipeline_name,
+        "removed_audio_overrides": removed,
+    }
+
+
 @router.get("")
 @router.get("/")
 async def get_config():
@@ -858,7 +1202,7 @@ async def update_yaml_config(update: ConfigUpdate):
         # Persist via the shared helper (also used by the structured tools CRUD
         # API). MED-E1 email validation now lives inside persist_config_content
         # so every persistence path enforces it (not just this endpoint).
-        result = persist_config_content(update.content)
+        result = await asyncio.to_thread(persist_config_content, update.content)
         return await reconcile_apply_result_with_engine_state(result)
     except HTTPException:
         raise
@@ -2109,6 +2453,16 @@ def update_yaml_provider_field(provider_name: str, field: str, value: Any) -> bo
     and writes the result to the LOCAL override file so the git-tracked
     base stays clean.
     """
+    with _CONFIG_UPDATE_LOCK:
+        return _update_yaml_provider_field_locked(provider_name, field, value)
+
+
+def _update_yaml_provider_field_locked(
+    provider_name: str,
+    field: str,
+    value: Any,
+) -> bool:
+    """Update one provider field while the shared config lock is held."""
     try:
         base_config = _read_base_config_dict()
         merged_config = _read_merged_config_dict()
@@ -2526,8 +2880,18 @@ async def upload_provider_api_key(provider_key: str, payload: Dict[str, Any]):
     if not api_key:
         raise HTTPException(status_code=400, detail="api_key is required")
     path = _provider_secret_path(provider_key, "api-key")
-    _write_provider_secret(provider_key, "api-key", api_key.encode("utf-8"))
-    _update_provider_credentials_field(provider_key, "api_key_file", path)
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "api-key",
+        api_key.encode("utf-8"),
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "api_key_file",
+        path,
+    )
     return {"status": "success", "restart_pending": True, "path": path}
 
 
@@ -2540,8 +2904,18 @@ async def upload_provider_agent_id(provider_key: str, payload: Dict[str, Any]):
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id is required")
     path = _provider_secret_path(provider_key, "agent-id")
-    _write_provider_secret(provider_key, "agent-id", agent_id.encode("utf-8"))
-    _update_provider_credentials_field(provider_key, "agent_id_file", path)
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "agent-id",
+        agent_id.encode("utf-8"),
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "agent_id_file",
+        path,
+    )
     return {"status": "success", "restart_pending": True, "path": path}
 
 
@@ -2566,8 +2940,18 @@ async def upload_provider_vertex_json(provider_key: str, file: UploadFile = File
     if creds.get("type") != "service_account":
         raise HTTPException(status_code=400, detail="JSON file must be a service account key (type: service_account)")
     path = _provider_secret_path(provider_key, "vertex-json")
-    _write_provider_secret(provider_key, "vertex-json", content)
-    _update_provider_credentials_field(provider_key, "credentials_path", path)
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "vertex-json",
+        content,
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "credentials_path",
+        path,
+    )
     return {
         "status": "success",
         "restart_pending": True,
@@ -2602,7 +2986,7 @@ async def delete_provider_credential(provider_key: str, credential_name: str):
     provider_cfg.pop(field, None)
     providers[provider_key] = provider_cfg
     merged["providers"] = providers
-    _save_merged_config(merged)
+    await asyncio.to_thread(_save_merged_config, merged)
     # Compute the on-disk path locally from (provider_key,
     # credential_name) so the unlink target is constructed from
     # validated inputs only — same no-taint shape as
@@ -2620,7 +3004,7 @@ async def delete_provider_credential(provider_key: str, credential_name: str):
         return {"status": "success", "restart_pending": True}
     canonical = Path(canonical_str)
     if canonical.exists():
-        canonical.unlink()
+        await asyncio.to_thread(canonical.unlink)
     return {"status": "success", "restart_pending": True}
 
 

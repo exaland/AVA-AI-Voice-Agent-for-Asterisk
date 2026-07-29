@@ -11,6 +11,22 @@ import { ConfigCard } from '../components/ui/ConfigCard';
 import { Modal } from '../components/ui/Modal';
 import { FormInput, FormSelect } from '../components/ui/FormComponents';
 import { getCachedConfig, loadConfigYaml } from '../utils/configCache';
+import AudioResetButton, { AudioResetResponse } from '../components/config/AudioResetButton';
+import AudioEnvironmentOverrideWarning from '../components/config/AudioEnvironmentOverrideWarning';
+
+type ApplyState = {
+    pendingApply: boolean;
+    applyMethod: 'hot_reload' | 'restart';
+};
+
+const mergeApplyRecommendation = (
+    current: ApplyState,
+    method: 'none' | 'hot_reload' | 'restart',
+): ApplyState => {
+    if (method === 'none') return current;
+    if (current.pendingApply && current.applyMethod === 'restart') return current;
+    return { pendingApply: true, applyMethod: method };
+};
 
 const ProfilesPage = () => {
 	const { confirm } = useConfirmDialog();
@@ -25,14 +41,39 @@ const ProfilesPage = () => {
 	const [profileForm, setProfileForm] = useState<any>({});
 	const [isNewProfile, setIsNewProfile] = useState(false);
 	const [newProfileName, setNewProfileName] = useState('');
-	const [pendingApply, setPendingApply] = useState(false);
 	const [applying, setApplying] = useState(false);
-	const [applyMethod, setApplyMethod] = useState<'hot_reload' | 'restart'>('restart');
+    const [applyState, setApplyState] = useState<ApplyState>({
+        pendingApply: false,
+        applyMethod: 'restart',
+    });
+    const { pendingApply, applyMethod } = applyState;
+    const [builtInAudioProfiles, setBuiltInAudioProfiles] = useState<ReadonlySet<string> | null>(null);
 
     useEffect(() => {
         fetchConfig();
         fetchAgents();
+        fetchProfileAudioBaselines();
     }, []);
+
+    const fetchProfileAudioBaselines = async () => {
+        try {
+            const response = await axios.get<{ built_in_profiles?: unknown }>(
+                '/api/config/profiles/audio/baselines',
+            );
+            const profiles = response.data?.built_in_profiles;
+            if (!Array.isArray(profiles) || !profiles.every((name) => typeof name === 'string')) {
+                throw new Error('Invalid profile audio baseline metadata');
+            }
+            setBuiltInAudioProfiles(new Set(profiles));
+        } catch (err) {
+            console.error('Failed to load profile audio baseline metadata', err);
+            setBuiltInAudioProfiles(null);
+        }
+    };
+
+    const isCustomAudioProfile = (profileName: string): boolean | undefined => (
+        builtInAudioProfiles ? !builtInAudioProfiles.has(profileName) : undefined
+    );
 
     const fetchAgents = async () => {
         setAgentsLoading(true);
@@ -61,6 +102,7 @@ const ProfilesPage = () => {
                 setError(null);
                 setYamlError(null);
             }
+            return r.config || {};
         } catch (err) {
             console.error('Failed to load config', err);
             const status = (err as any)?.response?.status;
@@ -70,8 +112,18 @@ const ProfilesPage = () => {
                 setError('Failed to load configuration. Check backend logs and try again.');
             }
             setYamlError(null);
+            return null;
         } finally {
             setLoading(false);
+        }
+    };
+
+    const handleProfileAudioResetComplete = async (profileName: string, response: AudioResetResponse) => {
+        const method = response?.recommended_apply_method || 'restart';
+        setApplyState((current) => mergeApplyRecommendation(current, method));
+        const refreshed = await fetchConfig(true);
+        if (refreshed && editingProfile === profileName) {
+            setProfileForm({ ...(refreshed.profiles?.[profileName] || {}) });
         }
     };
 
@@ -80,8 +132,7 @@ const ProfilesPage = () => {
             const sanitized = sanitizeConfigForSave(newConfig);
             const response = await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) });
             const method = (response.data?.recommended_apply_method || 'restart') as 'hot_reload' | 'restart';
-            setApplyMethod(method);
-            setPendingApply(true);
+            setApplyState((current) => mergeApplyRecommendation(current, method));
             setConfig(sanitized);
             return true;
         } catch (err) {
@@ -100,13 +151,12 @@ const ProfilesPage = () => {
 	                const response = await axios.post('/api/system/containers/ai_engine/reload');
 	                const status = response.data?.status ?? (response.status === 200 ? 'success' : undefined);
 	                if (status === 'partial' || response.data?.restart_required) {
-	                    setApplyMethod('restart');
-	                    setPendingApply(true);
+	                    setApplyState({ pendingApply: true, applyMethod: 'restart' });
 	                    toast.warning('Hot reload applied partially', { description: 'Restart AI Engine to fully apply changes' });
 	                    return;
 	                }
 	                if (status === 'success' || response.status === 200) {
-	                    setPendingApply(false);
+	                    setApplyState((current) => ({ ...current, pendingApply: false }));
 	                    toast.success('AI Engine hot reloaded! Changes are now active.');
 	                    fetchConfig(true);
 	                    return;
@@ -120,13 +170,13 @@ const ProfilesPage = () => {
 	                return;
 	            }
 	            if (status === 'degraded') {
-	                setPendingApply(false);
+	                setApplyState((current) => ({ ...current, pendingApply: false }));
 	                toast.warning('AI Engine restarted but may not be fully healthy', { description: response.data.output || 'Please verify manually' });
 	                fetchConfig(true);
 	                return;
 	            }
 	            if (status === 'success' || response.status === 200) {
-	                setPendingApply(false);
+	                setApplyState((current) => ({ ...current, pendingApply: false }));
 	                toast.success('AI Engine restarted! Changes are now active.');
 	                fetchConfig(true);
 	                return;
@@ -446,6 +496,7 @@ const ProfilesPage = () => {
                     </button>
                 </div>
             )}
+            <AudioEnvironmentOverrideWarning />
 			<div className="flex justify-between items-center">
 				<div>
 					<h1 className="text-3xl font-bold tracking-tight">Audio Profiles</h1>
@@ -523,7 +574,14 @@ const ProfilesPage = () => {
                                             </p>
                                         </div>
                                     </div>
-	                                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+	                                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
+	                                        <AudioResetButton
+	                                            scope="profile"
+	                                            target={profileName}
+	                                            customProfile={isCustomAudioProfile(profileName)}
+	                                            compact
+	                                            onResetComplete={(response) => handleProfileAudioResetComplete(profileName, response)}
+	                                        />
 	                                        <button
 	                                            onClick={(e) => {
 	                                                e.stopPropagation();
@@ -630,22 +688,32 @@ const ProfilesPage = () => {
 					footer={
 						<>
                             {!isNewProfile && (
-                                <button
-                                    onClick={() => {
-                                        if (editingProfile) {
-                                            handleDeleteProfile(editingProfile);
-                                        }
-                                    }}
-                                    disabled={!editingProfile || profileKeys.length <= 1 || agentsLoading || agentsLoadFailed}
-                                    title={agentsLoading || agentsLoadFailed
-                                        ? 'Agent usage must be verified before deleting a profile'
-                                        : profileKeys.length <= 1
-                                            ? 'Cannot delete the last remaining audio profile'
-                                            : undefined}
-                                    className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-destructive/30 text-destructive hover:bg-destructive/10 h-9 px-4 py-2 mr-auto"
-                                >
-                                    Delete
-                                </button>
+                                <div className="flex items-center gap-2 mr-auto">
+                                    {editingProfile && (
+                                        <AudioResetButton
+                                            scope="profile"
+                                            target={editingProfile}
+                                            customProfile={isCustomAudioProfile(editingProfile)}
+                                            onResetComplete={(response) => handleProfileAudioResetComplete(editingProfile, response)}
+                                        />
+                                    )}
+                                    <button
+                                        onClick={() => {
+                                            if (editingProfile) {
+                                                handleDeleteProfile(editingProfile);
+                                            }
+                                        }}
+                                        disabled={!editingProfile || profileKeys.length <= 1 || agentsLoading || agentsLoadFailed}
+                                        title={agentsLoading || agentsLoadFailed
+                                            ? 'Agent usage must be verified before deleting a profile'
+                                            : profileKeys.length <= 1
+                                                ? 'Cannot delete the last remaining audio profile'
+                                                : undefined}
+                                        className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-destructive/30 text-destructive hover:bg-destructive/10 h-9 px-4 py-2"
+                                    >
+                                        Delete
+                                    </button>
+                                </div>
                             )}
 							<button
 								onClick={() => {

@@ -2,6 +2,7 @@ import React from 'react';
 import ProviderCredentialsCard, { applyCredentialPatch } from './ProviderCredentialsCard';
 import HelpTooltip from '../../ui/HelpTooltip';
 import OutputResamplerField from './OutputResamplerField';
+import { enforceOpenAIRealtimeGaAudioContract } from '../../../utils/providerAudioContracts';
 
 // Current GA Realtime model catalog. Verified against OpenAI's official model
 // pages on 2026-05-25:
@@ -78,6 +79,7 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
         : (typeof config.response_modalities === 'string' && config.response_modalities
             ? config.response_modalities
             : 'audio');
+    const isGaApi = String(config.api_version || 'ga').toLowerCase() === 'ga';
 
     return (
         <div className="space-y-6">
@@ -179,11 +181,11 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                                 // pinned value.
                                 if (apiVersion === 'ga') {
                                     const isGaModel = OPENAI_REALTIME_MODELS.some(m => m.value === config.model);
-                                    onChange({
+                                    onChange(enforceOpenAIRealtimeGaAudioContract({
                                         ...config,
                                         api_version: apiVersion,
                                         model: isGaModel ? config.model : 'gpt-realtime',
-                                    });
+                                    }));
                                 } else {
                                     onChange({ ...config, api_version: apiVersion });
                                 }
@@ -593,10 +595,9 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                                     <>
                                         <strong>Output Encoding</strong> — codec OpenAI emits to the engine before any local transcoding.
                                         <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                            <li><code>linear16</code> / <code>pcm16</code> — uncompressed 16-bit PCM @ 24 kHz (OpenAI's native output)</li>
-                                            <li><code>ulaw</code> — request OpenAI to encode 8 kHz μ-law directly; saves an engine-side resample</li>
+                                            <li>GA sessions always request PCM16 at 24 kHz; the engine transcodes downstream.</li>
+                                            <li>Legacy Beta values remain editable only when Beta is selected.</li>
                                         </ul>
-                                        Pair with the matching Output Sample Rate.
                                     </>
                                 }
                                 link="https://platform.openai.com/docs/guides/realtime"
@@ -605,8 +606,9 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                         </div>
                         <select
                             className="w-full p-2 rounded border border-input bg-background"
-                            value={config.output_encoding || 'linear16'}
+                            value={isGaApi ? 'linear16' : (config.output_encoding || 'linear16')}
                             onChange={(e) => handleChange('output_encoding', e.target.value)}
+                            disabled={isGaApi}
                         >
                             <option value="linear16">Linear16</option>
                             <option value="pcm16">PCM16</option>
@@ -621,10 +623,9 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                                     <>
                                         <strong>Output Sample Rate</strong> — sample rate of OpenAI's emitted audio.
                                         <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                            <li><code>24000</code> — OpenAI's native rate for <code>pcm16</code> / <code>linear16</code></li>
-                                            <li><code>8000</code> — only when Output Encoding is <code>ulaw</code></li>
+                                            <li>GA sessions always use <code>24000</code> Hz PCM16 output.</li>
+                                            <li>Legacy Beta values remain editable only when Beta is selected.</li>
                                         </ul>
-                                        Mismatched rates produce distorted output — keep this aligned with the encoding above.
                                     </>
                                 }
                                 link="https://platform.openai.com/docs/guides/realtime"
@@ -634,9 +635,15 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                         <input
                             type="number"
                             className="w-full p-2 rounded border border-input bg-background"
-                            value={config.output_sample_rate_hz || 24000}
+                            value={isGaApi ? 24000 : (config.output_sample_rate_hz || 24000)}
                             onChange={(e) => handleChange('output_sample_rate_hz', parseInt(e.target.value))}
+                            disabled={isGaApi}
                         />
+                        {isGaApi && (
+                            <p className="text-xs text-muted-foreground">
+                                Fixed by the GA wire contract. Restore audio defaults removes stale legacy output overrides.
+                            </p>
+                        )}
                     </div>
                     <div className="space-y-2">
                         <div className="flex items-center gap-1.5">
@@ -696,7 +703,7 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                     <div className="md:col-span-2">
                         <OutputResamplerField
                             value={config.output_resampler}
-                            sourceRate={config.output_sample_rate_hz || 24000}
+                            sourceRate={isGaApi ? 24000 : (config.output_sample_rate_hz || 24000)}
                             targetRate={config.target_sample_rate_hz || 8000}
                             onChange={(value) => handleChange('output_resampler', value)}
                         />
