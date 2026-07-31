@@ -26,6 +26,10 @@ from src.audio.resampler import (
 from src.core.session_store import SessionStore
 from src.core.models import CallSession, PlaybackRef
 from src.config.provider_instances import FULL_AGENT_KINDS_WITH_NATIVE_TTS_GATING
+from src.utils.diagnostic_paths import (
+    DEFAULT_DIAGNOSTIC_TAP_DIR,
+    prepare_private_diagnostic_dir,
+)
 from .adaptive_streaming import (
     StreamCharacterizer,
     AdaptiveBufferController,
@@ -293,18 +297,22 @@ class StreamingPlaybackManager:
         except Exception:
             self.diag_post_secs = 2
         try:
-            self.diag_out_dir = str(self.streaming_config.get('diag_out_dir', '/tmp/ai-engine-taps') or '/tmp/ai-engine-taps')
+            self.diag_out_dir = str(
+                self.streaming_config.get('diag_out_dir', DEFAULT_DIAGNOSTIC_TAP_DIR)
+                or DEFAULT_DIAGNOSTIC_TAP_DIR
+            )
         except Exception:
-            self.diag_out_dir = '/tmp/ai-engine-taps'
+            self.diag_out_dir = DEFAULT_DIAGNOSTIC_TAP_DIR
         if self.diag_enable_taps:
             try:
-                os.makedirs(self.diag_out_dir, mode=0o700, exist_ok=True)
-                try:
-                    os.chmod(self.diag_out_dir, 0o700)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                self.diag_out_dir = prepare_private_diagnostic_dir(self.diag_out_dir)
+            except Exception as exc:
+                self.diag_enable_taps = False
+                logger.warning(
+                    "Diagnostic tap directory rejected; playback taps disabled",
+                    diag_out_dir=self.diag_out_dir,
+                    error=str(exc),
+                )
         # μ-law fast-path sanity guard (enabled by default)
         try:
             self.ulaw_fastpath_guard: bool = bool(self.streaming_config.get('ulaw_fastpath_guard', True))
@@ -2818,7 +2826,11 @@ class StreamingPlaybackManager:
                     # Per-segment diag tap flush (snapshot on first frame)
                     try:
                         info = self.active_streams.get(call_id, {})
-                        if info and bool(info.get('diag_enabled')):
+                        if (
+                            getattr(self, "diag_enable_taps", False)
+                            and info
+                            and bool(info.get('diag_enabled'))
+                        ):
                             try:
                                 raw_rate = int(info.get('tap_rate') or 0)
                             except Exception:
@@ -3581,7 +3593,11 @@ class StreamingPlaybackManager:
             # Diagnostic: write pre/post tap WAVs if enabled
             try:
                 info = self.active_streams.get(call_id, {})
-                if info and bool(info.get('diag_enabled')):
+                if (
+                    getattr(self, "diag_enable_taps", False)
+                    and info
+                    and bool(info.get('diag_enabled'))
+                ):
                     try:
                         raw_rate = int(info.get('tap_rate') or 0)
                     except Exception:
@@ -3742,21 +3758,6 @@ class StreamingPlaybackManager:
                                 logger.info("Wrote call-level post-compand PCM16 tap", call_id=call_id, path=fnc2, bytes=len(cpost), rate=crate)
                             except Exception:
                                 logger.warning("Failed to write call-level post-compand tap", call_id=call_id, path=fnc2, rate=crate, exc_info=True)
-                        if not getattr(self, "diag_enable_taps", False):
-                            try:
-                                if os.path.isdir(self.diag_out_dir):
-                                    prefix_pre = f"pre_compand_pcm16_{call_id}"
-                                    prefix_post = f"post_compand_pcm16_{call_id}"
-                                    for name in os.listdir(self.diag_out_dir):
-                                        if name.startswith(prefix_pre) or name.startswith(prefix_post):
-                                            fpath = os.path.join(self.diag_out_dir, name)
-                                            try:
-                                                if os.path.isfile(fpath):
-                                                    os.remove(fpath)
-                                            except Exception:
-                                                pass
-                            except Exception:
-                                pass
                     except Exception:
                         logger.debug("Call-level tap write failed", call_id=call_id, exc_info=True)
             except Exception:

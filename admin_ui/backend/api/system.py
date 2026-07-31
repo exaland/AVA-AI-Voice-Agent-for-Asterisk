@@ -8,6 +8,7 @@ import os
 import shutil
 import logging
 import re
+import shlex
 import subprocess
 import threading
 import tempfile
@@ -2482,14 +2483,36 @@ def _detect_os():
 
 def _detect_docker():
     """Detect Docker version and mode."""
-    sock_path = "/var/run/docker.sock"
-    socket_present = os.path.exists(sock_path)
+    # Match docker.from_env() endpoint resolution instead of assuming the
+    # rootful default. Docker SDK normalizes an unset/empty DOCKER_HOST to
+    # http+unix:///var/run/docker.sock and a configured unix:// endpoint to
+    # http+unix://<path>; TCP, SSH, and Windows named-pipe endpoints do not
+    # expose local Unix socket metadata.
+    docker_host = (os.environ.get("DOCKER_HOST") or "").strip()
+    try:
+        effective_endpoint = docker.utils.parse_host(docker_host or None)
+    except Exception:
+        # docker.from_env() will report the malformed endpoint below. Do not
+        # reinterpret a non-Unix value as a local filesystem path here.
+        effective_endpoint = docker_host or None
+
+    sock_path = None
+    if isinstance(effective_endpoint, str) and effective_endpoint.startswith("http+unix://"):
+        sock_path = effective_endpoint[len("http+unix://"):]
+        # UnixHTTPAdapter applies the same leading-slash compatibility rule for
+        # legacy unix://path values. normpath removes harmless duplicate
+        # separators without expanding variables or following filesystem links.
+        if not sock_path.startswith("/"):
+            sock_path = f"/{sock_path}"
+        sock_path = os.path.normpath(sock_path)
+
+    socket_present = bool(sock_path and os.path.exists(sock_path))
     docker_info = {
         "installed": False,
         "reachable": False,
         "version": None,
         "api_version": None,
-        "mode": "unknown",
+        "mode": "rootless" if sock_path and "/run/user/" in sock_path else "unknown",
         "status": "error",
         "message": "Docker not detected",
         "socket_present": socket_present,
@@ -2502,6 +2525,7 @@ def _detect_docker():
         "cli_present": shutil.which("docker") is not None,
         "is_docker_desktop": False,
         "permission_denied": False,
+        "client_adapter_error": False,
         "needs_docker_gid": None,
     }
 
@@ -2549,8 +2573,7 @@ def _detect_docker():
             pass
         
         # Detect rootless (check socket path)
-        docker_host = os.environ.get("DOCKER_HOST", "")
-        if "rootless" in docker_host or "/run/user/" in docker_host:
+        if "rootless" in docker_host or (sock_path and "/run/user/" in sock_path):
             docker_info["mode"] = "rootless"
         else:
             docker_info["mode"] = "rootful"
@@ -2568,6 +2591,22 @@ def _detect_docker():
             docker_info["status"] = "error"
             docker_info["permission_denied"] = True
             docker_info["message"] = "Docker daemon not accessible from Admin UI (permission denied to docker.sock)"
+        elif docker_info["socket_present"] and (
+            "not supported url scheme" in lowered
+            or "unsupported url scheme" in lowered
+            or "http+docker" in lowered
+        ):
+            # Docker SDK 7.0 combined with Requests 2.32+ fails before it can
+            # contact an otherwise healthy Unix socket.  Treat that as an
+            # Admin UI client/runtime problem, not as evidence that Docker is
+            # absent from the host.
+            docker_info["installed"] = True
+            docker_info["status"] = "error"
+            docker_info["client_adapter_error"] = True
+            docker_info["message"] = (
+                "Admin UI Docker client cannot use the configured Docker endpoint "
+                "(incompatible Docker SDK/Requests adapter)"
+            )
     
     return docker_info
 
@@ -2951,6 +2990,25 @@ def _build_checks(os_info, docker_info, compose_info, selinux_info, dir_info, as
                 }
             })
     elif docker_info.get("permission_denied"):
+        socket_path = docker_info.get("socket_path")
+        quoted_socket_path = shlex.quote(str(socket_path)) if socket_path else None
+        socket_gid = docker_info.get("socket_gid")
+        if quoted_socket_path:
+            gid_assignment = (
+                f"DOCKER_GID={shlex.quote(str(socket_gid))}"
+                if socket_gid is not None
+                else f"DOCKER_GID=$(stat -c '%g' -- {quoted_socket_path})"
+            )
+            permission_commands = [
+                f"ls -ln -- {quoted_socket_path}",
+                gid_assignment,
+                "grep -qE '^[# ]*DOCKER_GID=' .env && sed -i.bak -E \"s/^[# ]*DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/\" .env || echo \"DOCKER_GID=$DOCKER_GID\" >> .env",
+                "docker compose -p asterisk-ai-voice-agent up -d --force-recreate admin_ui",
+            ]
+        else:
+            permission_commands = [
+                "Review the configured DOCKER_HOST permissions and credentials",
+            ]
         checks.append({
             "id": "docker_socket_perms",
             "status": "error",
@@ -2962,14 +3020,23 @@ def _build_checks(os_info, docker_info, compose_info, selinux_info, dir_info, as
             "action": {
                 "type": "command",
                 "label": "Set DOCKER_GID and recreate admin_ui",
-                "value": "\n".join([
-                    "ls -ln /var/run/docker.sock",
-                    "DOCKER_GID=$(ls -ln /var/run/docker.sock | awk '{print $4}')",
-                    "grep -qE '^[# ]*DOCKER_GID=' .env && sed -i.bak -E \"s/^[# ]*DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/\" .env || echo \"DOCKER_GID=$DOCKER_GID\" >> .env",
-                    "docker compose -p asterisk-ai-voice-agent up -d --force-recreate admin_ui",
-                ]),
+                "value": "\n".join(permission_commands),
                 "docs_url": _github_docs_url("docs/TROUBLESHOOTING_GUIDE.md"),
                 "docs_label": "Troubleshooting guide",
+            },
+        })
+    elif docker_info.get("client_adapter_error"):
+        checks.append({
+            "id": "docker_client_adapter",
+            "status": "error",
+            "message": docker_info["message"],
+            "blocking": True,
+            "action": {
+                "type": "command",
+                "label": "Rebuild Admin UI",
+                "value": "docker compose -p asterisk-ai-voice-agent up -d --build --force-recreate admin_ui",
+                "docs_url": _github_docs_url("docs/INSTALLATION.md"),
+                "docs_label": "AAVA installation docs",
             },
         })
     elif docker_info["status"] == "error":
