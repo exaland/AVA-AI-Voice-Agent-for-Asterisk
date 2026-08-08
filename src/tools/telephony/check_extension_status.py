@@ -51,6 +51,71 @@ def _parse_dial_string_tech(dial_string: str) -> Optional[str]:
     return tech
 
 
+DEFAULT_STATE_MAPPING: Dict[str, Tuple[str, ...]] = {
+    "free": ("NOT_INUSE",),
+    "busy": ("INUSE", "BUSY", "RINGING", "RINGINUSE", "ONHOLD"),
+    "unavailable": ("UNAVAILABLE", "INVALID", "UNKNOWN"),
+}
+
+
+def resolve_state_mapping(cfg: Optional[dict]) -> Dict[str, set]:
+    """Merge operator config over defaults; each bucket falls back to its default when absent."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    resolved: Dict[str, set] = {}
+    for bucket, default in DEFAULT_STATE_MAPPING.items():
+        values = cfg.get(bucket)
+        if isinstance(values, (list, tuple)):
+            resolved[bucket] = {str(v).strip().upper() for v in values if str(v).strip()}
+        else:
+            resolved[bucket] = {v.upper() for v in default}
+    return resolved
+
+
+def classify_device_state(state: str, mapping: Dict[str, set]) -> str:
+    """Return 'free' | 'busy' | 'unavailable'. Precedence is free -> busy -> unavailable;
+    unlisted values fail closed to 'unavailable'."""
+    s = str(state or "").strip().upper()
+    if s in mapping.get("free", set()):
+        return "free"
+    if s in mapping.get("busy", set()):
+        return "busy"
+    if s in mapping.get("unavailable", set()):
+        return "unavailable"
+    return "unavailable"
+
+
+def _classify_custom_device_state(state: str, mapping: Dict[str, set]) -> str:
+    """A CUSTOM device state is an opt-in "unavailable" signal, not a fail-closed one:
+    it only makes the extension unavailable when its raw value classifies as busy.
+    Free/unavailable/unknown/empty/invalid raw values are not actively blocking, so they
+    classify as 'free' here (unlike native states, which stay fail-closed)."""
+    return "busy" if classify_device_state(state, mapping) == "busy" else "free"
+
+
+_STATUS_PRIORITY = ["in_call", "busy", "dnd", "ringing", "away", "on_hold", "unavailable", "unknown"]
+_NATIVE_BUSY_LABEL = {"INUSE": "in_call", "BUSY": "in_call", "RINGINUSE": "in_call",
+                      "RINGING": "ringing", "ONHOLD": "on_hold", "ACTIVE_CHANNELS": "in_call"}
+
+
+def _label_for(state_rec: dict) -> str:
+    cls = state_rec.get("classification")
+    if cls == "free":
+        return ""
+    if cls == "unavailable":
+        return "unavailable"
+    if state_rec.get("role") == "native":
+        return _NATIVE_BUSY_LABEL.get(str(state_rec.get("state", "")).strip().upper(), "busy")
+    return str(state_rec.get("status") or "").strip().lower() or "busy"
+
+
+def aggregate_availability(states: List[dict]) -> dict:
+    labels = [lbl for lbl in (_label_for(s) for s in states) if lbl]
+    if not labels:
+        return {"available": True, "availability_status": "available", "availability_reason": "available"}
+    top = min(labels, key=lambda label: _STATUS_PRIORITY.index(label) if label in _STATUS_PRIORITY else len(_STATUS_PRIORITY))
+    return {"available": False, "availability_status": top, "availability_reason": top}
+
+
 def _resolve_extension_entry(
     *,
     target: str,
@@ -269,6 +334,36 @@ async def _list_device_states(
     return [item for item in resp if isinstance(item, dict)]
 
 
+async def _query_custom_device_state(
+    *,
+    context: ToolExecutionContext,
+    device_state_id: str,
+) -> str:
+    """Query a single (typically custom/tracking) device state id and return its raw state."""
+    encoded_id = quote(device_state_id, safe="")
+    resp: Optional[Dict[str, Any]] = None
+    try:
+        resp = await context.ari_client.send_command(
+            method="GET",
+            resource=f"deviceStates/{encoded_id}",
+        )
+    except Exception:
+        logger.debug(
+            "ARI custom device state query failed",
+            device_state_id=device_state_id,
+            exc_info=True,
+        )
+        resp = None
+    if not isinstance(resp, dict) or "state" not in resp:
+        for item in await _list_device_states(context=context):
+            if str(item.get("name", "") or "") == device_state_id:
+                resp = item
+                break
+    if isinstance(resp, dict):
+        return str(resp.get("state", "") or "")
+    return ""
+
+
 async def _list_endpoints(
     *,
     context: ToolExecutionContext,
@@ -443,10 +538,21 @@ class CheckExtensionStatusTool(Tool):
         if restrict_to_configured:
             normalized_extension = str(extension or "").strip()
             extension_for_guardrail = normalized_extension
-            if device_state_id:
-                extracted_extension = _extract_extension_from_device_state_id(device_state_id)
-                if extracted_extension:
-                    extension_for_guardrail = extracted_extension
+            # A device_state_id param that matches one of the resolved extension's own
+            # configured custom device_states (#577) is treated as part of that extension's
+            # config, not an arbitrary caller-supplied state id.
+            configured_state_ids = {
+                str(ds.get("id", "") or "").strip()
+                for ds in (ext_entry.get("device_states") or [] if isinstance(ext_entry, dict) else [])
+                if isinstance(ds, dict)
+            } - {""}
+            is_configured_custom_state = bool(device_state_id) and device_state_id in configured_state_ids
+            if device_state_id and not is_configured_custom_state:
+                # An explicit device_state_id param must resolve to a configured extension
+                # via its "<TECH>/<extension>" shape (checked below); it must not silently
+                # fall back to the (unrelated) `extension` param's value, or an arbitrary
+                # device_state_id could ride along with a valid `extension` param.
+                extension_for_guardrail = _extract_extension_from_device_state_id(device_state_id)
 
             if not allowed_extensions:
                 logger.warning(
@@ -484,7 +590,7 @@ class CheckExtensionStatusTool(Tool):
                     "guardrail_blocked": True,
                     "allowed_extensions": allowed_extensions,
                 }
-            if device_state_id and not _looks_like_extension_number(extension_for_guardrail):
+            if device_state_id and not is_configured_custom_state and not _looks_like_extension_number(extension_for_guardrail):
                 logger.warning(
                     "Blocked status check for non-numeric device_state_id while configured-only guardrail is enabled",
                     call_id=context.call_id,
@@ -778,6 +884,100 @@ class CheckExtensionStatusTool(Tool):
             f"({availability_detail})."
         )
 
+        # Resolve any additional (e.g., custom DND/away tracking) device states configured
+        # for this extension and aggregate them together with the native device state into
+        # a single, labeled availability decision (#577).
+        mapping = resolve_state_mapping(
+            context.get_config_value("tools.check_extension_status.state_mapping", {}) or {}
+        )
+
+        active_channels_sources = {"device_state+endpoint_channels", "endpoint_state+endpoint_channels"}
+        lookup_failed_sources = {
+            "device_state+endpoint_channels_lookup_failed",
+            "endpoint_state+endpoint_channels_lookup_failed",
+        }
+        if availability_source in active_channels_sources:
+            # The #595 active-channel cross-check flipped an apparently-free native state to
+            # busy; represent that explicitly so aggregation labels it "in_call".
+            native_state, native_classification = "ACTIVE_CHANNELS", "busy"
+        elif availability_source in lookup_failed_sources:
+            native_state, native_classification = (state_norm or "UNAVAILABLE"), "unavailable"
+        elif state_norm:
+            native_state, native_classification = state_norm, classify_device_state(state_norm, mapping)
+        else:
+            native_state = endpoint_state.strip().upper() if endpoint_state else ""
+            native_classification = "free" if available else "unavailable"
+
+        configured_device_states = ext_entry.get("device_states") if isinstance(ext_entry, dict) else None
+        configured_custom_states = [
+            ds for ds in configured_device_states if isinstance(ds, dict)
+        ] if isinstance(configured_device_states, list) else []
+
+        # If resolved_id matches one of the extension's own configured custom device_states
+        # (the #577 guardrail carve-out), it is the SAME state as that entry -- represent it
+        # exactly once, as role="custom" with the entry's configured status, instead of also
+        # emitting a "native" record (which would mislabel a busy custom state, e.g. treat a
+        # DND state as an active call) and re-querying/duplicating it in the loop below (#600).
+        matching_configured = next(
+            (ds for ds in configured_custom_states if str(ds.get("id", "") or "").strip() == resolved_id),
+            None,
+        )
+        if matching_configured is not None:
+            device_state_records: List[Dict[str, Any]] = [{
+                "id": resolved_id,
+                "role": "custom",
+                "state": native_state,
+                "classification": _classify_custom_device_state(native_state, mapping),
+                "status": str(matching_configured.get("status", "") or "").strip(),
+            }]
+        else:
+            device_state_records = [{
+                "id": resolved_id,
+                "role": "native",
+                "state": native_state,
+                "classification": native_classification,
+            }]
+
+        for ds in configured_custom_states:
+            ds_id = str(ds.get("id", "") or "").strip()
+            if not ds_id or ds_id == resolved_id:
+                continue
+            ds_status = str(ds.get("status", "") or "").strip()
+            ds_state_norm = (await _query_custom_device_state(context=context, device_state_id=ds_id)).strip().upper()
+            device_state_records.append({
+                "id": ds_id,
+                "role": "custom",
+                "state": ds_state_norm,
+                "classification": _classify_custom_device_state(ds_state_norm, mapping),
+                "status": ds_status,
+            })
+
+        aggregated = aggregate_availability(device_state_records)
+        has_custom_states = any(r.get("role") == "custom" for r in device_state_records)
+
+        available = aggregated["available"]
+        availability_status = aggregated["availability_status"]
+        availability_reason_field = aggregated["availability_reason"]
+
+        # Always rebuild the message from the FINAL availability_status so it never
+        # contradicts `available`, whether or not custom device_states are configured.
+        status_messages = {
+            "available": f"Extension {resolved_extension} is available.",
+            "in_call": f"Extension {resolved_extension} is on a call.",
+            "dnd": f"Extension {resolved_extension} is on Do Not Disturb.",
+            "away": f"Extension {resolved_extension} is away.",
+            "on_hold": f"Extension {resolved_extension} is on hold.",
+            "ringing": f"Extension {resolved_extension} is ringing.",
+            "unavailable": f"Extension {resolved_extension} is unavailable.",
+            "busy": f"Extension {resolved_extension} is busy.",
+        }
+        availability_message = status_messages.get(
+            availability_status, f"Extension {resolved_extension} is unavailable."
+        )
+
+        if has_custom_states:
+            availability_source = "device_states_aggregate"
+
         result = {
             "status": "success",
             "target": target,
@@ -789,6 +989,9 @@ class CheckExtensionStatusTool(Tool):
             "device_state": state_norm or state,
             "available": available,
             "availability_source": availability_source,
+            "availability_status": availability_status,
+            "availability_reason": availability_reason_field,
+            "device_states": device_state_records,
             "message": availability_message,
         }
 
