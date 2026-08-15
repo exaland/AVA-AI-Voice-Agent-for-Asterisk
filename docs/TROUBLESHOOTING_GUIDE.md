@@ -701,6 +701,52 @@ The wizard writes operator changes to `config/ai-agent.local.yaml`. Switching fr
 
 ---
 
+## Outbound Lead Context Is Missing
+
+**Symptoms:** an AAVA-managed outbound attempt has nonempty `custom_vars`, but
+the Agent does not receive a `## Lead Context` block, or the attempt ends with
+`outbound custom_vars could not be confirmed after answer`.
+
+1. Find the attempt, lead, and channel identifiers in **Call Scheduling** and
+   the AI Engine logs. AAVA deliberately does not log the context payload.
+2. While the call is ringing, list the matching Local channels and inspect both
+   halves:
+
+   ```bash
+   asterisk -rx "core show channels concise" | grep 'Local/'
+   for half in 1 2; do
+     if asterisk -rx "core show channel <local-channel>;$half" \
+       | grep -q 'AAVA_CUSTOM_VARS_JSON'; then
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON present"
+     else
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON missing"
+     fi
+   done
+   ```
+
+   Keep this check presence-only. Printing the variable would expose the lead
+   context in the terminal and any retained RCA transcript.
+
+3. After answer, check for the sanitized confirmation or rejection markers:
+
+   ```bash
+   docker compose -p asterisk-ai-voice-agent logs ai_engine 2>&1 \
+     | grep -Ei \
+       'outbound custom_vars could not be confirmed after answer|outbound attempt metadata unavailable after answer|outbound custom_vars metadata is invalid after answer'
+   ```
+
+4. If the lead failed before dialing, reduce `custom_vars` below the 8,192-byte
+   serialized limit and retry with a new or recycled lead. Do not place secrets
+   in this field.
+5. If the variable is absent despite a current engine build, verify ARI write
+   permissions and retain the attempt/channel identifiers for RCA collection.
+
+AAVA fails closed for nonempty unconfirmed context: the attempt becomes
+`error`, the lead becomes `failed`, the answered channel is hung up, and the AI
+provider is not started.
+
+---
+
 ## Debugging Tool Execution Issues
 
 **Tool execution** allows AI agents to perform actions like call transfers, hangups, and sending emails. When tools don't work, follow this debugging workflow.

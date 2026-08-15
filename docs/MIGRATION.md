@@ -23,6 +23,29 @@ After upgrading:
 Rollback uses the normal prior tagged images and the pre-update configuration
 backup. There is no database downgrade step.
 
+## Outbound `custom_vars` compatibility note (#613)
+
+The outbound `custom_vars` correction is an in-place call-path fix with no
+database migration, Agent reassignment, or configuration rewrite.
+
+After upgrading to a release that includes #613:
+
+1. Rebuild and recreate `ai_engine` before resuming AAVA-managed campaigns.
+2. Run one supervised HUMAN call with a distinctive, non-sensitive value such
+   as `"validation_token":"issue613-7f3a"`. Ask the Agent to repeat that field
+   and compare its response exactly with the supplied token; a general behavior
+   change is not sufficient delivery evidence.
+3. FreePBX operators should verify the configured outbound identity, route, and
+   caller ID. `AMPUSER`, `FROMEXTEN`, inherited caller-ID values, `AI_AGENT`, and
+   `AI_PROVIDER` are now applied at ARI origination as originally intended.
+4. Ensure existing lead context is no larger than 8,192 serialized bytes and
+   does not contain credentials or secrets. Invalid or unconfirmed nonempty
+   context now fails the attempt instead of allowing an incomplete AI call.
+
+Rollback uses the prior application image; there is no database downgrade.
+Pause running campaigns before rollback so in-flight calls stay on one engine
+version.
+
 ## v7.5.3 to v7.5.4
 
 v7.5.4 is an in-place patch release with no database migration, Agent
