@@ -340,6 +340,11 @@ Request:
     { "name": "hangup_call", "parameters": { "type": "object", "properties": { "farewell_message": { "type": "string" } } } }
   ],
   "tool_policy": "auto",
+  "hangup_policy": {
+    "markers": { "end_call": ["goodbye", "да", "нет"] }
+  },
+  "hangup_marker_source": "agent_extend",
+  "hangup_marker_digest": "1a6c689923e0cb01",
   "protocol_version": 2
 }
 ```
@@ -348,6 +353,9 @@ Notes:
 
 - `tool_policy` valid values: `"auto"`, `"strict"`, `"compatible"`, `"off"`.
 - Sending `tool_context` more than once per call is allowed and replaces the prior state.
+- `hangup_policy.markers.end_call` is the effective, normalized list captured by the engine for this call. The Local AI Server binds it to `call_id`; a different call clears the previous list before processing.
+- `hangup_marker_source` is diagnostic metadata. When `hangup_policy` is present, `protocol_version` and `hangup_marker_digest` are required. The server normalizes the accepted markers, recomputes the digest, and requires an exact match before enabling `hangup_call`.
+- Invalid marker payloads, unsupported protocol versions, and digest mismatches disable `hangup_call` for that call. Tool contexts without `hangup_policy` retain the legacy global-marker behavior. Full Local clients check `status_response.capabilities.session_hangup_markers` before sending a non-default list and fail call setup against older servers.
 
 ---
 
@@ -492,6 +500,7 @@ Response:
 {
   "type": "status_response",
   "status": "ok",
+  "capabilities": { "session_hangup_markers": true },
   "stt_backend": "vosk|kroko|sherpa|faster_whisper|whisper_cpp",
   "tts_backend": "piper|kokoro|melotts|silero",
   "models": {
@@ -549,6 +558,7 @@ Notes:
 
 - `models.stt.device` and `models.stt.compute_type` are only emitted for the `faster_whisper` backend (otherwise `null`).
 - `config.enable_filler_audio` and `config.llm_streaming_tts_overlap` reflect runtime-only flags that can be flipped via `switch_model` `runtime_config` without reloading STT/LLM/TTS.
+- `capabilities.session_hangup_markers=true` means this server accepts effective call-scoped end-of-call markers in `tool_context` and isolates them by `call_id`.
 
 Schema:
 
